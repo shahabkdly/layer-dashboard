@@ -1,0 +1,2992 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Layer dashboard</title>
+<link rel="icon" href="data:,"><!-- no favicon request: nothing leaves the machine -->
+<!--
+  LAYER DASHBOARD: offline GIS dashboard (MapLibre GL JS + DuckDB-WASM)
+
+  WAYS TO RUN IT (nothing to install for the people who use it)
+    Portable desktop app     npm run dist  ->  dist/Layer dashboard-<version>-win.zip  (unzip anywhere)
+                             or  dist/Layer dashboard <version> portable.exe  (one file, runs anywhere).
+                             Copy the folder to a USB stick, a share or any PC: it carries its own
+                             browser engine, libraries and basemap, and keeps saved layouts in a
+                             "data" folder beside the .exe. An installer (Setup .exe) is built too.
+    Double-click, browser    "Open in browser.cmd" in this folder: a tiny web server built into
+                             Windows (PowerShell) serves it on localhost and opens your browser.
+    Developers               npm install && node get-libs.mjs && npm start
+    The page is the same file every way: window.desktop only exists in the desktop build, which
+    adds native Open/Save dialogs, a menu, file associations and "Open .gdb folder".
+
+  FOLDER LAYOUT
+    index.html          this file
+    get-libs.mjs        run once with internet:  node get-libs.mjs
+    electron/           desktop shell: main.js (app:// protocol + menu), preload.js, zipdir.js
+    package.json        npm start (run) and npm run dist (build installers)
+    dashboard.json      optional: a saved layout ("Layout > Save layout file"); when present it is
+                        the default layout for everyone who opens the page with matching data
+    lib/                created by get-libs.mjs (~180 MB, nothing is fetched at run time)
+      maplibre-gl.*       map
+      duckdb/             DuckDB-WASM (bundled with Apache Arrow)
+      ext/                DuckDB "spatial" extension: .gpkg and .shp
+      gdal/               GDAL-WASM (gdal3.js): .gdb only, loaded the first time one is opened
+      basemap/            offline streets for one area (default Riyadh / Diriyah, ~20 MB);
+                          other area: node get-libs.mjs --basemap-only --bbox=minLon,minLat,maxLon,maxLat
+      pmtiles.js, rtl-text.js   basemap reader, Arabic label shaping
+
+  ANY WEB SERVER WORKS TOO (browsers block WebAssembly workers on file://, so not a bare double-click)
+    Open in browser.cmd / serve.ps1   built into Windows, nothing to install
+    python -m http.server 8080        then open http://localhost:8080
+    or copy the folder to an intranet web server / IIS / shared web folder
+
+  LOADING DATA (drop files anywhere on the page, or use "Open files")
+    .geojson / .json          parsed in the browser
+    .gpkg                     DuckDB spatial (ST_Read); reprojected from the layer's CRS
+    .shp + .dbf + .shx (+.prj) select them together, or drop them zipped
+    Name.gdb.zip              zip the whole .gdb folder; read by GDAL-WASM, because
+                              DuckDB-WASM's spatial build has no OpenFileGDB driver
+                              (desktop app: pick the .gdb folder itself, it zips it for you)
+
+  DASHBOARD
+    A 12-column grid of widgets: indicators, category charts, histograms, time charts, gauges,
+    feature lists, attribute tables, feature details, selectors (value / number range / date range)
+    and text, around one map with search, rectangle selection, legend and light or dark basemaps.
+    Any widget can be maximized; the header switches between a light and a dark theme; Export
+    saves filtered features (GeoJSON, CSV), a map image (PNG), or prints / saves a PDF.
+    "Edit layout" lets you drag widgets by their title bar,
+    resize them from the bottom-right corner, add widgets and open each widget's settings.
+    Every widget's settings include how it works with the map:
+      When clicked      filter the map and other widgets / zoom the map / highlight on the map /
+                        locate the feature / nothing
+      Follows filters   whether the widget narrows when other widgets filter
+      Follows map view  whether the widget only counts features inside the current map view
+    Each widget's own query applies every filter except its own, so a chart keeps its context
+    (hatched = all features, solid = current selection).
+    Layouts are saved in this browser per dataset (same field names = same layout).
+-->
+<link rel="stylesheet" href="lib/maplibre-gl.css">
+<script>
+/* theme before first paint: saved choice, else the system setting */
+(function () {
+  var t = null;
+  try { t = localStorage.getItem('theme'); } catch (e) { /* storage blocked */ }
+  document.documentElement.dataset.theme = t === 'dark' || t === 'light' ? t : (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+})();
+</script>
+<style>
+:root{
+  --bg:#eef1f5; --panel:#ffffff; --panel2:#f4f6f9; --field:#ffffff; --ink:#1b2430; --ink2:#5d6978; --ink3:#8b96a4;
+  --rule:#e2e6eb; --rule2:#cfd6de; --accent:#1f6fd1; --accent-soft:#e4eefc; --num:#1f6fd1;
+  --sel:#d4198a; --sel-soft:rgba(212,25,138,.10); --warn-soft:#fff6d9;
+  --bar:#2b6f9e; --hatch:#b9c3cd; --track:#e4e9ef; --err:#b3261e; --water:#d7e5e9;
+  --shadow:0 1px 2px rgba(16,24,40,.05),0 1px 4px rgba(16,24,40,.07);
+  --shadow-lg:0 14px 36px rgba(16,24,40,.18),0 2px 6px rgba(16,24,40,.08);
+  --sans:"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;
+  --display:"Segoe UI Variable Display","Segoe UI",system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;
+  --radius:10px; --row:46px; --gap:10px;    /* minimum row height; rows stretch to fill the window when they fit */
+  color-scheme:light;
+}
+:root[data-theme="dark"]{
+  --bg:#0e1115; --panel:#171b21; --panel2:#1f242c; --field:#11151a; --ink:#e6eaef; --ink2:#a2acb8; --ink3:#76808d;
+  --rule:#272d35; --rule2:#39414c; --accent:#4d94ff; --accent-soft:rgba(77,148,255,.15); --num:#6aa9ff;
+  --sel:#ff4fae; --sel-soft:rgba(255,79,174,.14); --warn-soft:rgba(255,196,0,.10);
+  --bar:#56a3d9; --hatch:#46505c; --track:#29303a; --err:#ff8a80; --water:#1a232d;
+  --shadow:0 1px 2px rgba(0,0,0,.35); --shadow-lg:0 16px 40px rgba(0,0,0,.55);
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{display:flex;flex-direction:column;height:100vh;height:100dvh;font:14px/1.45 var(--sans);color:var(--ink);background:var(--bg);-webkit-font-smoothing:antialiased}
+button,select,input,textarea{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+[hidden]{display:none!important}
+.ic{width:18px;height:18px;flex:none;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:var(--rule2);border:2px solid transparent;border-radius:10px;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background-color:var(--ink3)}
+::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:transparent}
+
+/* header */
+.top{position:relative;z-index:5;display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--rule);box-shadow:var(--shadow)}
+.brand{display:flex;align-items:center;gap:12px;margin-right:auto;min-width:0}
+.logo{display:grid;place-items:center;flex:none;width:38px;height:38px;border-radius:10px;background:linear-gradient(135deg,#1f6fd1,#6a4fe0);color:#fff;box-shadow:0 2px 8px rgba(31,111,209,.35)}
+.logo .ic{width:21px;height:21px;stroke-width:2}
+.titles{min-width:0}
+#dashTitle{display:block;font:600 18px/1.2 var(--display);letter-spacing:-.01em;border-radius:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+body.editing #dashTitle{outline:1px dashed var(--ink3);outline-offset:3px;cursor:text}
+.titles small{display:block;margin-top:1px;font-size:12px;color:var(--ink2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.actions{display:flex;align-items:center;flex-wrap:wrap;gap:6px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;height:34px;padding:0 13px;border:1px solid var(--rule2);border-radius:8px;background:var(--panel);color:var(--ink);font-weight:500;white-space:nowrap;cursor:pointer;transition:background .12s,border-color .12s,color .12s}
+.btn .ic{width:17px;height:17px}
+.btn:hover:not(:disabled){background:var(--panel2);border-color:var(--ink3)}
+.btn:disabled{opacity:.45;cursor:default}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover:not(:disabled){background:var(--accent);border-color:var(--accent);filter:brightness(1.08)}
+.btn[aria-pressed="true"]{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.btn.icon{width:34px;padding:0}
+.btn.sm{height:28px;padding:0 9px;border-radius:7px;font-size:12.5px}
+.btn.icon.sm{width:28px;padding:0}
+.btn.sm .ic{width:15px;height:15px}
+.sel{height:34px;padding:0 8px;border:1px solid var(--rule2);border-radius:8px;background:var(--panel);min-width:0}
+.menu{position:relative}
+.menu summary{list-style:none}
+.menu summary::-webkit-details-marker{display:none}
+.menuList{position:absolute;right:0;top:calc(100% + 6px);z-index:30;display:flex;flex-direction:column;min-width:280px;padding:6px;border:1px solid var(--rule);border-radius:12px;background:var(--panel);box-shadow:var(--shadow-lg)}
+.menuList h4{margin:6px 10px 4px;font-size:11px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--ink3)}
+.menuList button{display:flex;align-items:center;gap:10px;padding:8px 10px;border:0;border-radius:7px;background:none;text-align:left;cursor:pointer}
+.menuList button .ic{color:var(--ink2)}
+.menuList button:hover:not(:disabled){background:var(--panel2)}
+.menuList button:disabled{opacity:.45;cursor:default}
+.menuList hr{width:100%;margin:6px 0;border:0;border-top:1px solid var(--rule)}
+
+/* filter bar and edit bar: one row above the widgets */
+.filterBar,.editBar{display:flex;align-items:center;flex-wrap:wrap;gap:6px 10px;padding:7px 16px;border-bottom:1px solid var(--rule);font-size:13px}
+.filterBar{background:var(--sel-soft)}
+.filterBar .lbl{display:flex;align-items:center;gap:6px;font-weight:600;color:var(--sel)}
+.filterBar .lbl .ic{width:16px;height:16px}
+.editBar{background:var(--warn-soft)}
+.editBar span{margin-right:auto;color:var(--ink2)}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{display:inline-flex;align-items:center;gap:7px;max-width:360px;height:26px;padding:0 5px 0 11px;border:1px solid var(--sel);border-radius:13px;background:var(--panel);font-size:12.5px;cursor:pointer}
+.chip:hover{background:var(--sel-soft)}
+.chip .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chip .x{display:grid;place-items:center;width:17px;height:17px;border-radius:50%;background:var(--sel);color:#fff;font-size:11px;line-height:1}
+.chip.plain{padding:0 11px;border-color:var(--rule2);color:var(--ink2)}
+
+/* dashboard grid: 12 columns, rows of --row px */
+.grid{flex:1;min-height:0;overflow:auto;display:grid;grid-template-columns:repeat(12,minmax(0,1fr));grid-auto-rows:minmax(var(--row),1fr);grid-auto-flow:row dense;gap:var(--gap);padding:var(--gap)}
+.grid.solo{grid-template-rows:1fr;grid-auto-rows:1fr}
+.grid.solo .wg{grid-row:auto}
+.grid.maxed{grid-template-rows:1fr;grid-auto-rows:0}
+.grid.maxed>.wg:not(.max){display:none}
+.grid.maxed>.wg.max{grid-column:1/-1;grid-row:1/-1}
+.wg{grid-column:span var(--w);grid-row:span var(--h);position:relative;display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--panel);border:1px solid var(--rule);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+.wg>header{display:flex;align-items:center;gap:6px;min-height:38px;padding:8px 8px 0 14px}
+.wg>header h2{flex:1;min-width:0;margin:0;font:600 13.5px/1.25 var(--display);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wg .tools{display:flex;gap:2px;opacity:0;transition:opacity .12s}
+.wg:hover .tools,.wg:focus-within .tools,.wg.max .tools,body.editing .wg .tools{opacity:1}
+.wg .tools button{display:grid;place-items:center;width:26px;height:26px;padding:0;border:0;border-radius:6px;background:none;color:var(--ink2);cursor:pointer}
+.wg .tools button:hover{background:var(--panel2);color:var(--ink)}
+.wg .tools .ic{width:16px;height:16px}
+.wg .tools .cfg{display:none}
+body.editing .wg .tools .cfg{display:grid}
+.wg .body{position:relative;flex:1;min-height:0;padding:6px 14px 12px;overflow:hidden}
+.wg.t-map .body{padding:0}
+.wg.t-map>header{display:none}
+.wg .resize{display:none;position:absolute;right:2px;bottom:2px;z-index:8;width:18px;height:18px;cursor:nwse-resize;touch-action:none;background:linear-gradient(135deg,transparent 0 55%,var(--ink3) 55% 60%,transparent 60% 70%,var(--ink3) 70% 75%,transparent 75%)}
+body.editing .wg{outline:2px dashed var(--rule2);outline-offset:-2px}
+body.editing .wg .resize{display:block}
+body.editing .wg>header{cursor:grab}
+body.editing .wg.t-map>header{display:flex;position:absolute;z-index:9;top:10px;left:50%;transform:translateX(-50%);min-height:0;padding:4px 4px 4px 12px;border:1px solid var(--rule2);border-radius:8px;background:var(--panel);box-shadow:var(--shadow)}
+.wg.dragging{opacity:.4}
+.wg.dropBefore{box-shadow:-4px 0 0 var(--accent)}
+.wg.dropAfter{box-shadow:4px 0 0 var(--accent)}
+.note{margin:6px 0 0;font-size:12px;color:var(--ink2)}
+.missing{display:grid;place-content:center;height:100%;padding:8px;text-align:center;font-size:13px;color:var(--err)}
+
+/* indicator: size follows the widget (container query units) */
+.ind{width:100%;height:100%;container-type:size;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;padding:0;border:0;border-radius:6px;background:none;text-align:center;cursor:pointer}
+.ind:hover{background:var(--panel2)}
+.ind.inert{cursor:default}
+.ind.inert:hover{background:none}
+.ind .v{max-width:100%;font:600 min(46cqh,18cqw)/1.05 var(--display);letter-spacing:-.02em;color:var(--num);font-variant-numeric:lining-nums tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ind .l{max-width:100%;font-size:clamp(11px,15cqh,13.5px);color:var(--ink2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* horizontal bars: hatched = all features, solid = current selection */
+.bars{height:100%;overflow:auto}
+.bar{display:grid;grid-template-columns:minmax(64px,34%) 1fr 3.6em;gap:10px;align-items:center;width:100%;padding:4px 4px;border:0;border-radius:6px;background:none;text-align:left;cursor:pointer}
+.bar:hover{background:var(--panel2)}
+.bar .lab{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar .cnt{text-align:right;color:var(--ink2);font-variant-numeric:tabular-nums}
+.track{position:relative;height:16px}
+.ghost{position:absolute;top:0;bottom:0;left:0;border-radius:4px;background:repeating-linear-gradient(135deg,var(--hatch) 0 1px,transparent 1px 4px)}
+.fill{position:absolute;top:2px;bottom:2px;left:0;background:var(--bar);border-radius:4px;transition:width .2s}
+.filtering .bar:not(.on) .fill{opacity:.35}
+.bar.on .fill{background:var(--sel)!important}
+.bar.on .lab{font-weight:600}
+.bar.mark{box-shadow:inset 3px 0 0 var(--sel)}
+
+/* columns (histogram, time, category columns) */
+.cols{display:flex;flex-direction:column;height:100%}
+.plot{position:relative;flex:1;min-height:40px;margin-left:40px}
+.gl{position:absolute;left:0;right:0;border-top:1px solid var(--rule)}
+.gl::before{content:attr(data-v);position:absolute;right:calc(100% + 6px);top:-8px;font-size:11px;color:var(--ink3);font-variant-numeric:tabular-nums;white-space:nowrap}
+.colrow{position:absolute;inset:0;display:flex;align-items:flex-end;gap:3px}
+.col{position:relative;flex:1;min-width:0;height:100%;padding:0;border:0;border-radius:4px 4px 0 0;background:none;cursor:pointer}
+.col:hover{background:var(--panel2)}
+.cg{position:absolute;left:0;right:0;bottom:0;border-radius:3px 3px 0 0;background:repeating-linear-gradient(135deg,var(--hatch) 0 1px,transparent 1px 4px)}
+.cf{position:absolute;left:1px;right:1px;bottom:0;background:var(--bar);border-radius:4px 4px 0 0;transition:height .2s}
+.filtering .col:not(.on) .cf{opacity:.35}
+.col.on .cf{background:var(--sel)!important}
+.line .col.on{background:var(--sel-soft)}
+.col.mark::after{content:"";position:absolute;left:0;right:0;bottom:-5px;height:3px;background:var(--sel)}
+.lineSvg{position:absolute;inset:0;width:100%;height:100%;overflow:visible;pointer-events:none}
+.xaxis{display:flex;justify-content:space-between;gap:6px;margin:7px 0 0 40px;font-size:11px;color:var(--ink3);font-variant-numeric:tabular-nums}
+.xlabs{display:flex;gap:3px;margin:6px 0 0 40px;font-size:11px;color:var(--ink2)}
+.xlabs span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center}
+
+/* pie / donut / gauge */
+.pie{display:flex;align-items:center;gap:14px;height:100%}
+.pie svg{flex:none;height:100%;max-height:100%;max-width:55%;aspect-ratio:1}
+.pie path{cursor:pointer;stroke:var(--panel);stroke-width:.025;transition:opacity .15s}
+.pie.filtering path:not(.on){opacity:.35}
+.pie path.on{stroke:var(--sel);stroke-width:.05}
+.leg{flex:1;min-width:0;max-height:100%;overflow:auto}
+.leg button{display:grid;grid-template-columns:12px 1fr auto;gap:8px;align-items:center;width:100%;padding:3px 5px;border:0;border-radius:5px;background:none;text-align:left;cursor:pointer;font-size:13px}
+.leg button:hover{background:var(--panel2)}
+.leg button.on{font-weight:600}
+.leg i{width:12px;height:12px;border-radius:3px}
+.leg .n{color:var(--ink2);font-variant-numeric:tabular-nums}
+.gauge{position:relative;display:flex;align-items:center;justify-content:center;gap:14px;width:100%;height:100%;padding:0;border:0;border-radius:6px;background:none;cursor:pointer;container-type:size}
+.gauge:hover{background:var(--panel2)}
+.gauge svg{height:100%;max-width:50%;aspect-ratio:1}
+.gauge .txt{display:flex;flex-direction:column;align-items:flex-start;min-width:0}
+.gauge .pct{font:600 min(40cqh,16cqw)/1 var(--display);letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.gauge .sub{font-size:12px;color:var(--ink2);white-space:nowrap}
+.gauge.on .pct{color:var(--sel)}
+
+/* list */
+.list{height:100%;display:flex;flex-direction:column}
+.list .rows{flex:1;min-height:0;overflow:auto;border-top:1px solid var(--rule)}
+.li{display:grid;grid-template-columns:10px 1fr auto;gap:2px 10px;align-items:baseline;width:100%;padding:7px 6px;border:0;border-bottom:1px solid var(--rule);background:none;text-align:left;cursor:pointer}
+.li:hover{background:var(--panel2)}
+.li.on{background:var(--sel-soft);box-shadow:inset 3px 0 0 var(--sel)}
+.li i{width:9px;height:9px;border-radius:50%;background:var(--bar);align-self:center}
+.li .t{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.li .s{grid-column:2/4;font-size:12px;color:var(--ink2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.li .v{font-variant-numeric:tabular-nums;color:var(--ink2)}
+.textw{height:100%;overflow:auto;white-space:pre-line;line-height:1.55}
+
+/* table */
+.tbl{display:flex;flex-direction:column;height:100%}
+.tblbar{display:flex;align-items:center;gap:8px;margin:0 0 6px}
+.tblbar .note{margin:0 auto 0 0}
+.tblwrap{flex:1;min-height:0;overflow:auto;border:1px solid var(--rule);border-radius:8px}
+.tblwrap table{width:100%;border-collapse:separate;border-spacing:0;font-size:12.5px;font-variant-numeric:tabular-nums}
+.tblwrap th{position:sticky;top:0;z-index:1;padding:0;background:var(--panel2);border-bottom:1px solid var(--rule);text-align:left;white-space:nowrap}
+.tblwrap th button{display:flex;align-items:center;gap:4px;width:100%;padding:7px 10px;border:0;background:none;font-weight:600;color:var(--ink2);text-align:left;cursor:pointer}
+.tblwrap th button:hover{color:var(--ink)}
+.tblwrap th.num button{justify-content:flex-end}
+.tblwrap th .arr{font-size:10px;color:var(--accent)}
+.tblwrap td{max-width:280px;padding:6px 10px;border-bottom:1px solid var(--rule);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tblwrap td.num{text-align:right}
+.tblwrap tbody tr{cursor:pointer}
+.tblwrap tbody tr:hover td{background:var(--panel2)}
+.tblwrap tbody tr.on td{background:var(--sel-soft)}
+.tblwrap tbody tr.on td:first-child{box-shadow:inset 3px 0 0 var(--sel)}
+
+/* details */
+.det{display:flex;flex-direction:column;height:100%}
+.detbar{display:flex;align-items:center;gap:4px;margin:0 0 8px}
+.detbar .pos{margin-right:auto;font-size:12px;color:var(--ink2)}
+.det h3{margin:0 0 6px;font:600 16px/1.25 var(--display);overflow-wrap:anywhere}
+.det dl{flex:1;min-height:0;overflow:auto;display:grid;grid-template-columns:minmax(80px,40%) 1fr;align-content:start;margin:0;font-size:13px}
+.det dt,.det dd{padding:5px 0;border-bottom:1px solid var(--rule)}
+.det dt{padding-right:10px;color:var(--ink2);overflow-wrap:anywhere}
+.det dd{margin:0;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+.badge{display:inline-block;padding:1px 8px;border-radius:10px;background:var(--sel-soft);color:var(--sel);font-size:11.5px;font-weight:600}
+
+/* selector */
+.selw{display:flex;flex-direction:column;justify-content:center;gap:8px;height:100%}
+.selw>.sel{width:100%;height:36px}
+.opts{flex:1 1 auto;min-height:0;display:flex;flex-wrap:wrap;align-content:flex-start;gap:6px;overflow:auto;padding:1px}
+.opt{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 11px;border:1px solid var(--rule2);border-radius:15px;background:var(--panel);font-size:13px;cursor:pointer}
+.opt:hover{border-color:var(--ink3)}
+.opt .n{font-size:11.5px;color:var(--ink3);font-variant-numeric:tabular-nums}
+.opt.on{background:var(--sel);border-color:var(--sel);color:#fff}
+.opt.on .n{color:rgba(255,255,255,.8)}
+.opt.zero:not(.on){opacity:.5}
+.range{position:relative;height:28px;margin:0 9px}
+.range .rtrack,.range .rfill{position:absolute;top:12px;height:4px;border-radius:2px}
+.range .rtrack{left:0;right:0;background:var(--track)}
+.range .rfill{background:var(--accent)}
+.range input{position:absolute;left:-9px;right:-9px;top:5px;width:calc(100% + 18px);height:18px;margin:0;background:none;pointer-events:none;-webkit-appearance:none;appearance:none}
+.range input::-webkit-slider-thumb{width:18px;height:18px;border:2px solid var(--accent);border-radius:50%;background:var(--panel);box-shadow:var(--shadow);cursor:pointer;pointer-events:auto;-webkit-appearance:none}
+.range input::-moz-range-thumb{width:14px;height:14px;border:2px solid var(--accent);border-radius:50%;background:var(--panel);cursor:pointer;pointer-events:auto}
+.rvals{display:flex;justify-content:space-between;gap:8px;font-size:12.5px;font-variant-numeric:tabular-nums}
+.dates{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.dates label{display:flex;flex-direction:column;gap:2px;min-width:0;font-size:11.5px;color:var(--ink2)}
+.dates input{height:32px;min-width:0;padding:0 6px;border:1px solid var(--rule2);border-radius:7px;background:var(--field);color:var(--ink)}
+.selfoot{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;color:var(--ink2)}
+.linkbtn{padding:0;border:0;background:none;color:var(--accent);font-size:12px;cursor:pointer}
+.linkbtn:hover{text-decoration:underline}
+
+/* map widget: optional neatline with live coordinates */
+#mapwrap{position:absolute;inset:0;background:var(--panel);--fl:0px;--fb:0px;--ft:0px;--fr:0px}
+#mapwrap.framed{--fl:62px;--fb:24px;--ft:8px;--fr:8px}
+#mapbox{position:absolute;left:var(--fl);right:var(--fr);top:var(--ft);bottom:var(--fb);background:var(--water);overflow:hidden}
+#mapwrap.framed #mapbox{border:1.5px solid var(--ink2)}
+#map{position:absolute;inset:0}
+#frameX,#frameY{position:absolute;pointer-events:none;font-size:11px;color:var(--ink2);font-variant-numeric:tabular-nums}
+#mapwrap:not(.framed) #frameX,#mapwrap:not(.framed) #frameY{display:none}
+#frameX{left:var(--fl);right:var(--fr);bottom:0;height:var(--fb);overflow:hidden}
+#frameY{left:0;top:var(--ft);bottom:var(--fb);width:var(--fl)}
+#frameX span{position:absolute;top:5px;transform:translateX(-50%);white-space:nowrap}
+#frameX span::before{content:"";position:absolute;left:50%;top:-5px;height:4px;border-left:1px solid var(--ink2)}
+#frameY span{position:absolute;right:7px;transform:translateY(-50%);white-space:nowrap}
+#frameY span::after{content:"";position:absolute;right:-7px;top:50%;width:5px;border-top:1px solid var(--ink2)}
+.maptools{position:absolute;top:10px;left:10px;right:58px;z-index:4;display:flex;flex-wrap:wrap;align-items:flex-start;gap:6px;pointer-events:none}
+.maptools>*{pointer-events:auto}
+.mgroup{display:flex;align-items:center;height:36px;border:1px solid var(--rule);border-radius:9px;background:var(--panel);box-shadow:var(--shadow)}
+.mgroup .btn{height:34px;border:0;border-radius:0;background:transparent}
+.mgroup .btn.icon{width:36px}
+.mgroup .btn+.btn{border-left:1px solid var(--rule)}
+.mgroup .btn:first-child{border-radius:8px 0 0 8px}
+.mgroup .btn:last-child{border-radius:0 8px 8px 0}
+.mgroup .btn:hover:not(:disabled){background:var(--panel2)}
+.mgroup .btn[aria-pressed="true"]{background:var(--accent-soft);color:var(--accent)}
+.mgroup.base{gap:6px;padding-left:10px;color:var(--ink2)}
+.mgroup.base .sel{height:34px;border:0;border-left:1px solid var(--rule);border-radius:0 8px 8px 0;background:transparent;color:var(--ink)}
+.search{position:relative;width:min(280px,100%)}
+.search input{width:100%;height:36px;padding:0 10px 0 34px;border:1px solid var(--rule);border-radius:9px;background:var(--panel);box-shadow:var(--shadow);outline:none}
+.search input:focus{border-color:var(--accent)}
+.search>.ic{position:absolute;left:10px;top:9px;color:var(--ink3);pointer-events:none}
+.results{position:absolute;left:0;right:0;top:calc(100% + 4px);max-height:320px;overflow:auto;padding:4px;border:1px solid var(--rule);border-radius:10px;background:var(--panel);box-shadow:var(--shadow-lg)}
+.results button{display:block;width:100%;padding:6px 9px;border:0;border-radius:7px;background:none;text-align:left;cursor:pointer}
+.results button:hover,.results button.act{background:var(--panel2)}
+.results b{display:block;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.results span{display:block;font-size:12px;color:var(--ink2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.results p{margin:6px 9px;font-size:12.5px;color:var(--ink2)}
+#mapbox.selecting{touch-action:none}
+#mapbox.selecting .maplibregl-canvas{cursor:crosshair!important}
+#rect{position:absolute;z-index:2;pointer-events:none;border:2px dashed var(--sel);background:var(--sel-soft)}
+.legend{position:absolute;left:10px;bottom:10px;z-index:2;max-width:60%;max-height:45%;overflow:auto;padding:9px 11px;border:1px solid var(--rule);border-radius:9px;background:var(--panel);box-shadow:var(--shadow);font-size:12px}
+.legend .lt{margin-bottom:4px;font-weight:600}
+.legend div{display:flex;align-items:center;gap:8px;margin:3px 0}
+.legend i{flex:none;width:14px;height:10px;border-radius:2px}
+.legend .ramp{width:150px;height:10px;border-radius:2px}
+.legend .ends{display:flex;justify-content:space-between;width:150px;color:var(--ink2);font-variant-numeric:tabular-nums}
+.printMap{position:absolute;inset:0;z-index:1;width:100%;height:100%;object-fit:cover}
+
+/* MapLibre controls in the dashboard's colours */
+.maplibregl-ctrl-group{border:1px solid var(--rule);border-radius:9px!important;background:var(--panel)!important;box-shadow:var(--shadow)!important;overflow:hidden}
+.maplibregl-ctrl-group button{width:34px;height:34px}
+.maplibregl-ctrl-group button+button{border-top:1px solid var(--rule)!important}
+.maplibregl-ctrl-group button:not(:disabled):hover{background:var(--panel2)!important}
+.maplibregl-ctrl-scale{border-color:var(--ink2);background:color-mix(in srgb,var(--panel) 80%,transparent);color:var(--ink)}
+.maplibregl-ctrl-attrib{background:color-mix(in srgb,var(--panel) 80%,transparent)!important;color:var(--ink2)}
+.maplibregl-ctrl-attrib a{color:var(--ink2)}
+[data-theme="dark"] .maplibregl-ctrl-group .maplibregl-ctrl-icon,[data-theme="dark"] .maplibregl-ctrl-attrib-button{filter:invert(1)}
+.maplibregl-popup-content{padding:12px 14px;border:1px solid var(--rule);border-radius:10px;background:var(--panel);box-shadow:var(--shadow-lg);font:13px/1.4 var(--sans);color:var(--ink)}
+.maplibregl-popup-close-button{padding:0 8px;border-radius:0 10px 0 6px;color:var(--ink2);font-size:18px}
+.maplibregl-popup-close-button:hover{background:var(--panel2)}
+.maplibregl-popup-anchor-top .maplibregl-popup-tip,.maplibregl-popup-anchor-top-left .maplibregl-popup-tip,.maplibregl-popup-anchor-top-right .maplibregl-popup-tip{border-bottom-color:var(--panel)}
+.maplibregl-popup-anchor-bottom .maplibregl-popup-tip,.maplibregl-popup-anchor-bottom-left .maplibregl-popup-tip,.maplibregl-popup-anchor-bottom-right .maplibregl-popup-tip{border-top-color:var(--panel)}
+.maplibregl-popup-anchor-left .maplibregl-popup-tip{border-right-color:var(--panel)}
+.maplibregl-popup-anchor-right .maplibregl-popup-tip{border-left-color:var(--panel)}
+.pop h3{margin:0 18px 8px 0;font:600 15px var(--display)}
+.pop dl{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;max-height:220px;margin:0;overflow:auto}
+.pop dt{color:var(--ink2)}
+.pop dd{margin:0;overflow-wrap:anywhere}
+
+/* empty state */
+.empty{position:absolute;inset:0;z-index:6;display:grid;place-items:center;padding:24px;overflow:auto;background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:blur(3px)}
+.emptyCard{display:grid;justify-items:start;gap:14px;max-width:580px;padding:30px 32px;border:1px solid var(--rule);border-radius:16px;background:var(--panel);box-shadow:var(--shadow-lg)}
+.emptyCard .logo{width:50px;height:50px;border-radius:13px}
+.emptyCard .logo .ic{width:27px;height:27px}
+.emptyCard h2{margin:0;font:600 24px/1.2 var(--display);letter-spacing:-.02em}
+.emptyCard p{max-width:56ch;margin:0;color:var(--ink2)}
+.emptyCard .row{display:flex;flex-wrap:wrap;gap:8px}
+.fmts{display:flex;flex-wrap:wrap;gap:6px}
+.fmts span{padding:2px 10px;border:1px solid var(--rule);border-radius:12px;background:var(--panel2);font-size:12px;color:var(--ink2)}
+#emptyMsg{color:var(--err)}
+#emptyMsg:empty{display:none}
+
+/* messages, tooltip, drop overlay */
+#msg{position:fixed;z-index:40;left:50%;bottom:24px;transform:translateX(-50%);display:flex;align-items:center;gap:10px;max-width:min(560px,92%);padding:10px 16px;border-radius:10px;background:#1b2430;color:#fff;font-size:13px;box-shadow:var(--shadow-lg);cursor:pointer}
+[data-theme="dark"] #msg{background:#2b323c}
+#msg.err{background:#b3261e}
+#msg .spin{flex:none;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+#tip{position:fixed;z-index:50;max-width:280px;padding:7px 10px;border-radius:7px;background:#1b2430;color:#fff;font-size:12.5px;line-height:1.4;white-space:pre-line;pointer-events:none;box-shadow:var(--shadow-lg)}
+[data-theme="dark"] #tip{background:#2b323c}
+#drop{position:fixed;inset:0;z-index:60;display:grid;place-items:center;padding:24px;background:rgba(10,14,20,.7);backdrop-filter:blur(2px);pointer-events:none}
+#drop div{display:grid;justify-items:center;gap:10px;padding:40px 56px;border:2px dashed rgba(255,255,255,.7);border-radius:18px;color:#fff;font:600 22px var(--display)}
+#drop .ic{width:40px;height:40px}
+
+/* settings dialogs */
+dialog{width:min(480px,94vw);max-height:90vh;padding:0;border:1px solid var(--rule);border-radius:14px;background:var(--panel);color:var(--ink);box-shadow:var(--shadow-lg)}
+dialog.wide{width:min(620px,94vw)}
+dialog::backdrop{background:rgba(10,14,20,.45);backdrop-filter:blur(2px)}
+.dlg{display:flex;flex-direction:column;max-height:90vh}
+.dlg>h2{margin:0;padding:18px 20px 10px;font:600 18px var(--display)}
+.dlg .scroll{overflow:auto;padding:0 20px}
+.dlg fieldset{margin:0 0 12px;padding:10px 0 0;border:0;border-top:1px solid var(--rule)}
+.dlg legend{padding:0 8px 0 0;font-size:11px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--ink3)}
+.dlg label{display:flex;flex-direction:column;gap:4px;margin:0 0 10px;font-size:12.5px;color:var(--ink2)}
+.dlg label.chk{flex-direction:row;align-items:center;gap:8px;color:var(--ink);font-size:13.5px}
+.dlg .sel,.dlg input[type=text],.dlg input[type=number],.dlg textarea{width:100%;height:34px;padding:0 9px;border:1px solid var(--rule2);border-radius:8px;background:var(--field);color:var(--ink);font-size:14px}
+.dlg textarea{height:auto;min-height:90px;padding:7px 9px;resize:vertical}
+.dlg input:focus,.dlg select:focus,.dlg textarea:focus{border-color:var(--accent);outline:none}
+.dlg input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent)}
+.dlg .two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.dlg .checks{display:grid;grid-template-columns:1fr 1fr;gap:0 12px;max-height:190px;overflow:auto;padding:6px 10px;border:1px solid var(--rule2);border-radius:8px;background:var(--field)}
+.dlg .checks label{margin:3px 0;color:var(--ink);font-size:13px}
+.dlg .foot{display:flex;flex-wrap:wrap;gap:8px;padding:12px 20px 16px;border-top:1px solid var(--rule)}
+.dlg .foot .gap{flex:1}
+.btn.danger{border-color:var(--err);color:var(--err)}
+.btn.danger:hover:not(:disabled){background:var(--err);border-color:var(--err);color:#fff}
+.types{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:8px;padding-bottom:14px}
+.types button{display:grid;grid-template-columns:auto 1fr;align-content:start;gap:2px 12px;padding:11px 13px;border:1px solid var(--rule);border-radius:11px;background:var(--panel);text-align:left;cursor:pointer}
+.types button:hover{border-color:var(--accent);background:var(--accent-soft)}
+.types .ic{grid-row:span 2;width:22px;height:22px;margin-top:2px;color:var(--accent)}
+.types b{font:600 14px var(--display)}
+.types span{font-size:12.5px;color:var(--ink2)}
+
+/* phones: one column, heights from the widget's row count */
+@media (max-width:820px){
+  .grid{grid-template-columns:minmax(0,1fr);grid-auto-rows:auto;align-content:start}
+  .wg{grid-column:auto;grid-row:auto;height:max(130px,calc(var(--h) * 52px))}
+  .wg.t-map{height:420px}
+  .grid.solo .wg.t-map{height:auto;min-height:460px}
+  .grid.maxed>.wg.max{height:auto}
+  #mapwrap.framed{--fl:56px}
+  .brand{flex-basis:100%}
+  .btn .lbl{display:none}
+  .btn:has(.lbl){width:34px;padding:0}
+  .wg .resize{display:none!important}
+  .wg .tools{opacity:1}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation-duration:.01ms!important}}
+@media print{
+  @page{margin:10mm}
+  html,body{height:auto;background:#fff}
+  body{display:block}
+  .top{box-shadow:none}
+  .top .actions,.maptools,.maplibregl-ctrl-top-right,.wg .tools,.wg .resize,.editBar,#msg,#tip{display:none!important}
+  .grid{overflow:visible;grid-auto-rows:minmax(var(--row),auto)}
+  .wg{break-inside:avoid;box-shadow:none}
+}
+</style>
+</head>
+<body>
+<!-- icon set (24px, stroke) -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-logo" viewBox="0 0 24 24"><path d="M12 3 3 7.5 12 12l9-4.5L12 3z"/><path d="M3 12l9 4.5 9-4.5"/><path d="M3 16.5 12 21l9-4.5"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+  <symbol id="i-sample" viewBox="0 0 24 24"><path d="M12 3l1.8 4.6L18.5 9l-4.7 1.6L12 15l-1.8-4.4L5.5 9l4.7-1.4z"/><path d="M18.5 15.5l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16v4z"/><path d="M13.5 6.5l4 4"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><path d="M4 4h7v7H4zM13 4h7v4h-7zM13 10h7v10h-7zM4 13h7v7H4z"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+  <symbol id="i-max" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></symbol>
+  <symbol id="i-min" viewBox="0 0 24 24"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><path d="M15 4v4M9 10v4M17 16v4"/></symbol>
+  <symbol id="i-select" viewBox="0 0 24 24"><path d="M4 4h2.5M10 4h3M16.5 4H19v2.5M4 7.5V10M4 13.5v2.5M4 19.5V20h3M10.5 20h1M19 10v1.5"/><path d="M14 14l7 2.6-3 1.1-1.2 3.1z"/></symbol>
+  <symbol id="i-target" viewBox="0 0 24 24"><path d="M12 6a6 6 0 1 0 0 12 6 6 0 0 0 0-12z"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4M12 12h0"/></symbol>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="M3 11l9-7 9 7"/><path d="M5 10v10h5v-6h4v6h5V10"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14z"/><path d="M20 20l-4-4"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 15V4M7 9l5-5 5 5M5 20h14"/></symbol>
+  <symbol id="i-print" viewBox="0 0 24 24"><path d="M7 9V4h10v5"/><path d="M7 17H5a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-2"/><path d="M7 14h10v6H7z"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><path d="M4 5h16v14H4z"/><path d="M4 16l5-5 4 4 2-2 5 5"/><path d="M15.5 9h0"/></symbol>
+  <symbol id="i-table" viewBox="0 0 24 24"><path d="M4 5h16v14H4zM4 10h16M4 15h16M10 5v14"/></symbol>
+  <symbol id="i-reset" viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.4-5.7"/><path d="M4 4v4h4"/></symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 5h16l-6 8v5l-4 2v-7z"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12l5 5 9-10"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+  <symbol id="i-prev" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></symbol>
+  <symbol id="i-next" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+  <symbol id="i-hash" viewBox="0 0 24 24"><path d="M5 9h15M4 15h15M10 4 8 20M16 4l-2 16"/></symbol>
+  <symbol id="i-bars" viewBox="0 0 24 24"><path d="M4 6h12M4 12h16M4 18h8"/></symbol>
+  <symbol id="i-hist" viewBox="0 0 24 24"><path d="M4 20V13h4v7M10 20V6h4v14M16 20v-9h4v9M3 20h18"/></symbol>
+  <symbol id="i-time" viewBox="0 0 24 24"><path d="M3 17l5-6 4 4 8-9"/><path d="M3 21h18"/></symbol>
+  <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 4a8 8 0 1 0 8 8"/><path d="M12 4a8 8 0 0 1 8 8"/><path d="M12 12l4-4"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11M4.5 6h0M4.5 12h0M4.5 18h0"/></symbol>
+  <symbol id="i-text" viewBox="0 0 24 24"><path d="M5 6V4h14v2M12 4v16M9 20h6"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z"/><path d="M12 11v6M12 7.5h0"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h16M4 17h16"/><path d="M9 4v6M15 14v6"/></symbol>
+  <symbol id="i-map" viewBox="0 0 24 24"><path d="M9 4 3 6v14l6-2 6 2 6-2V4l-6 2-6-2zM9 4v14M15 6v14"/></symbol>
+</svg>
+
+<header class="top">
+  <div class="brand">
+    <span class="logo"><svg class="ic"><use href="#i-logo"/></svg></span>
+    <div class="titles"><span id="dashTitle" spellcheck="false">Layer dashboard</span><small id="srcName">No layer loaded</small></div>
+  </div>
+  <select id="layerSel" class="sel" hidden aria-label="Layer in this file"></select>
+  <div class="actions">
+    <button class="btn primary" id="openBtn" type="button" disabled><svg class="ic"><use href="#i-folder"/></svg><span class="lbl">Open files</span></button>
+    <button class="btn" id="sampleBtn" type="button" disabled><svg class="ic"><use href="#i-sample"/></svg><span class="lbl">Sample data</span></button>
+    <button class="btn" id="editBtn" type="button" aria-pressed="false" disabled><svg class="ic"><use href="#i-edit"/></svg><span class="lbl">Edit layout</span></button>
+    <details class="menu" id="layoutMenu">
+      <summary class="btn"><svg class="ic"><use href="#i-download"/></svg><span class="lbl">Export</span><svg class="ic" style="width:14px;height:14px"><use href="#i-chev"/></svg></summary>
+      <div class="menuList">
+        <h4>Export</h4>
+        <button type="button" id="exportBtn" disabled><svg class="ic"><use href="#i-map"/></svg>Filtered features (GeoJSON)</button>
+        <button type="button" id="csvBtn" disabled><svg class="ic"><use href="#i-table"/></svg>Filtered features (CSV, opens in Excel)</button>
+        <button type="button" id="pngBtn" disabled><svg class="ic"><use href="#i-image"/></svg>Map image (PNG)</button>
+        <button type="button" id="printBtn" disabled><svg class="ic"><use href="#i-print"/></svg>Print or save as PDF…</button>
+        <hr>
+        <h4>Layout</h4>
+        <button type="button" id="saveLayoutBtn" disabled><svg class="ic"><use href="#i-download"/></svg>Save layout file (dashboard.json)</button>
+        <button type="button" id="loadLayoutBtn" disabled><svg class="ic"><use href="#i-upload"/></svg>Load layout file…</button>
+        <button type="button" id="resetLayoutBtn" disabled><svg class="ic"><use href="#i-reset"/></svg>Reset to automatic layout</button>
+      </div>
+    </details>
+    <button class="btn icon" id="themeBtn" type="button" title="Switch theme"><svg class="ic"><use href="#i-moon"/></svg></button>
+  </div>
+  <input type="file" id="fileIn" multiple hidden accept=".gpkg,.shp,.shx,.dbf,.prj,.cpg,.zip,.geojson,.json">
+  <input type="file" id="layoutIn" hidden accept=".json,application/json">
+</header>
+<div class="filterBar" id="filterBar" hidden><span class="lbl"><svg class="ic"><use href="#i-filter"/></svg>Filters</span><div class="chips" id="chips"></div></div>
+<div class="editBar" id="editBar" hidden>
+  <span>Drag a title bar to move a widget, drag its corner to resize, and use the settings button for its content and map interaction.</span>
+  <button class="btn sm" id="addBtn" type="button"><svg class="ic"><use href="#i-plus"/></svg>Add widget</button>
+  <button class="btn sm primary" id="doneBtn" type="button"><svg class="ic"><use href="#i-check"/></svg>Done</button>
+</div>
+<main class="grid solo" id="grid" aria-label="Dashboard"></main>
+
+<!-- the map lives here and is moved into the map widget; it is never rebuilt -->
+<div id="mapHolder" hidden>
+  <div id="mapwrap">
+    <div id="frameY"></div>
+    <div id="frameX"></div>
+    <div id="mapbox">
+      <div id="map"></div>
+      <div id="rect" hidden></div>
+      <div class="maptools">
+        <div class="search" id="searchBox" hidden>
+          <svg class="ic"><use href="#i-search"/></svg>
+          <input id="searchIn" type="search" placeholder="Search features" autocomplete="off" spellcheck="false" aria-label="Search features">
+          <div class="results" id="results" hidden></div>
+        </div>
+        <div class="mgroup">
+          <button class="btn icon" id="boxBtn" type="button" aria-pressed="false" title="Select features by drawing a rectangle"><svg class="ic"><use href="#i-select"/></svg></button>
+          <button class="btn icon" id="fitBtn" type="button" title="Zoom to the filtered features"><svg class="ic"><use href="#i-target"/></svg></button>
+          <button class="btn icon" id="homeBtn" type="button" title="Zoom to the whole layer"><svg class="ic"><use href="#i-home"/></svg></button>
+          <button class="btn icon" id="mapMaxBtn" type="button" title="Maximize the map"><svg class="ic"><use href="#i-max"/></svg></button>
+        </div>
+        <label class="mgroup base" title="Basemap"><svg class="ic"><use href="#i-map"/></svg>
+          <select id="baseSel" class="sel" aria-label="Basemap">
+            <option value="offline">Streets (offline)</option>
+            <option value="offline-dark">Dark streets (offline)</option>
+            <option value="osm">OpenStreetMap (online)</option>
+            <option value="none">No basemap</option>
+          </select>
+        </label>
+      </div>
+      <div id="legend" class="legend" hidden></div>
+      <div id="empty" class="empty">
+        <div class="emptyCard">
+          <span class="logo"><svg class="ic"><use href="#i-logo"/></svg></span>
+          <h2>Build a dashboard from a map layer</h2>
+          <p>Open a GeoPackage, a shapefile, a zipped file geodatabase or a GeoJSON file, or drop it anywhere on this window. A dashboard of charts, figures and a map is built for it straight away, and every widget can be changed.</p>
+          <div class="fmts"><span>.gpkg</span><span>.shp + .dbf + .shx (+ .prj)</span><span>Name.gdb.zip</span><span>.geojson</span><span>zipped shapefile</span></div>
+          <div class="row" id="emptyBtns">
+            <button class="btn primary" id="openBtn2" type="button" disabled><svg class="ic"><use href="#i-folder"/></svg>Open files</button>
+            <button class="btn" id="sampleBtn2" type="button" disabled><svg class="ic"><use href="#i-sample"/></svg>Try sample data</button>
+          </div>
+          <p class="note" id="bootMsg">Starting the analysis engine…</p>
+          <p id="emptyMsg" role="status"></p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="msg" role="status" hidden></div>
+<div id="tip" hidden></div>
+<div id="drop" hidden><div><svg class="ic"><use href="#i-upload"/></svg>Drop files to load</div></div>
+<dialog id="cfgDlg"><form class="dlg" id="cfgForm" method="dialog"></form></dialog>
+<dialog id="addDlg" class="wide"><form class="dlg" method="dialog">
+  <h2>Add a widget</h2>
+  <div class="scroll"><div class="types" id="typeList"></div></div>
+  <div class="foot"><span class="gap"></span><button class="btn" value="cancel">Cancel</button></div>
+</form></dialog>
+
+<script src="lib/maplibre-gl.js"></script>
+<script src="lib/pmtiles.js"></script><!-- offline basemap reader; optional -->
+
+<script type="module">
+/* ================================================================
+   1. PURE HELPERS: no DOM, no libraries, so they can be unit-tested
+   ================================================================ */
+// <pure>
+// categorical order validated for colour-blind separation (dataviz validate_palette.js)
+const CAT_COLORS = ['#2c7fb8', '#e08a1e', '#3a9d6e', '#7b5ea7', '#b5523b', '#1f9bb5', '#8c8f3a'];
+const OTHER_COLOR = '#9aa5ad';
+const RAMP = ['#f6e3a1', '#e08a1e', '#7f2b18'];
+const DERIVED = { _area_km2: 'Area (km²)', _len_km: 'Length (km)', fid: 'Feature ID' };
+const STAT_NAME = { count: 'Count', sum: 'Total', avg: 'Average', min: 'Lowest', max: 'Highest' };
+
+const label = n => (n == null ? '' : DERIVED[n] || n);
+const qid = n => '"' + String(n).replaceAll('"', '""') + '"';
+const qstr = s => "'" + String(s).replaceAll("'", "''") + "'";
+const nz = x => { const n = Number(x); if (!Number.isFinite(n)) throw new Error('Not a finite number: ' + x); return String(n); };
+const catExpr = f => `COALESCE(CAST(${qid(f)} AS VARCHAR), '(blank)')`;
+const aggSql = (stat, vf) => (stat === 'count' || !vf) ? 'COUNT(*)' : `CAST(${stat.toUpperCase()}(${qid(vf)}) AS DOUBLE)`;
+
+/* WHERE clause from the filter map (source id -> { sql, text }). `except` leaves out the
+   asking widget's own filter, which is what keeps a chart's context while others narrow. */
+function buildWhere(F, except, extra) {
+  const w = [];
+  for (const [id, f] of F) if (id !== except) w.push(f.sql);
+  if (extra) w.push(extra);
+  return w.length ? w.map(x => `(${x})`).join(' AND ') : 'TRUE';
+}
+const extentSql = b => `_maxx >= ${nz(b[0])} AND _minx <= ${nz(b[2])} AND _maxy >= ${nz(b[1])} AND _miny <= ${nz(b[3])}`;
+const sqlCats = (c, w) => `SELECT ${catExpr(c)} AS k, COUNT(*) AS v FROM f WHERE ${w} GROUP BY 1 ORDER BY v DESC, k LIMIT 100`;
+const sqlHist = (v, lo, bw, nb, w) => `SELECT CAST(LEAST(FLOOR((${qid(v)} - ${nz(lo)}) / ${nz(bw)}), ${nb - 1}) AS INTEGER) AS b, COUNT(*) AS n FROM f WHERE ${qid(v)} IS NOT NULL AND (${w}) GROUP BY 1 ORDER BY 1`;
+const sqlExtent = w => `SELECT MIN(_minx) AS x0, MIN(_miny) AS y0, MAX(_maxx) AS x1, MAX(_maxy) AS y1 FROM f WHERE ${w}`;
+const sqlIds = w => `SELECT fid FROM f WHERE ${w}`;
+
+/* Column names that are safe in SQL and in MapLibre expressions. */
+function cleanNames(keys) {
+  const seen = new Set(['fid']);
+  const out = new Map();
+  for (const k of keys) {
+    let n = String(k).trim().replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || 'field';
+    if (/^[0-9]/.test(n)) n = 'f_' + n;
+    const base = n;
+    let i = 2;
+    while (seen.has(n.toLowerCase())) n = base + '_' + i++;
+    seen.add(n.toLowerCase());
+    out.set(k, n);
+  }
+  return out;
+}
+
+/* Geometry measures on WGS84 lon/lat (spherical approximation, fine for dashboards). */
+const rad = d => d * Math.PI / 180;
+function ringArea(c) {           // Chamberlain-Duquette, same method as Turf.js
+  const n = c.length;
+  let t = 0;
+  if (n > 2) {
+    for (let i = 0; i < n; i++) {
+      const p1 = c[i === n - 1 ? n - 1 : i === n - 2 ? n - 2 : i];
+      const p2 = c[i === n - 1 ? 0 : i === n - 2 ? n - 1 : i + 1];
+      const p3 = c[i === n - 1 ? 1 : i === n - 2 ? 0 : i + 2];
+      t += (rad(p3[0]) - rad(p1[0])) * Math.sin(rad(p2[1]));
+    }
+    t = t * 6378137 * 6378137 / 2;
+  }
+  return t;
+}
+function polyArea(rings) {
+  let a = Math.abs(ringArea(rings[0]));
+  for (let i = 1; i < rings.length; i++) a -= Math.abs(ringArea(rings[i]));
+  return a;
+}
+function hav(a, b) {
+  const dLat = rad(b[1] - a[1]), dLon = rad(b[0] - a[0]);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a[1])) * Math.cos(rad(b[1])) * Math.sin(dLon / 2) ** 2;
+  return 2 * 6371008.8 * Math.asin(Math.sqrt(h));
+}
+function lineLen(cs) { let s = 0; for (let i = 1; i < cs.length; i++) s += hav(cs[i - 1], cs[i]); return s; }
+
+function measureGeom(g) {
+  let area = 0, len = 0, minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+  const bb = p => { if (p[0] < minx) minx = p[0]; if (p[0] > maxx) maxx = p[0]; if (p[1] < miny) miny = p[1]; if (p[1] > maxy) maxy = p[1]; };
+  const walk = geom => {
+    if (!geom) return;
+    const c = geom.coordinates;
+    switch (geom.type) {
+      case 'Point': bb(c); break;
+      case 'MultiPoint': c.forEach(bb); break;
+      case 'LineString': c.forEach(bb); len += lineLen(c); break;
+      case 'MultiLineString': c.forEach(l => { l.forEach(bb); len += lineLen(l); }); break;
+      case 'Polygon': c.forEach(r => { r.forEach(bb); len += lineLen(r); }); area += polyArea(c); break;
+      case 'MultiPolygon': c.forEach(p => { p.forEach(r => { r.forEach(bb); len += lineLen(r); }); area += polyArea(p); }); break;
+      case 'GeometryCollection': geom.geometries.forEach(walk); break;
+    }
+  };
+  walk(g);
+  return { area, len, bbox: [minx, miny, maxx, maxy] };
+}
+
+function featuresFromGeoJSON(j) {
+  if (j && j.type === 'FeatureCollection') return j.features || [];
+  if (j && j.type === 'Feature') return [j];
+  if (j && j.type && j.coordinates) return [{ type: 'Feature', geometry: j, properties: {} }];
+  throw new Error('This JSON file is not GeoJSON.');
+}
+
+// ISO-like dates and timestamps: 2024-05-03, 2024-05-03 09:30:00, 2024-05-03T09:30:00Z
+const DATE_RE = /^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?(Z|[+-]\d{2}:?\d{2})?$/;
+
+/* Features in, dashboard dataset out: cleaned properties (fid = array index), derived
+   area/length, bounding boxes, and each field's kind: num, str (text) or date. */
+function buildDataset(input) {
+  let features = (input || []).filter(f => f && f.geometry && f.geometry.type);
+  let meas = features.map(f => measureGeom(f.geometry));
+  const keep = meas.map(m => Number.isFinite(m.bbox[0]));
+  features = features.filter((_, i) => keep[i]);
+  meas = meas.filter((_, i) => keep[i]);
+  if (!features.length) throw new Error('The layer has no features with geometry.');
+
+  const keys = [];
+  const seenKey = new Set();
+  for (const f of features) for (const k in (f.properties || {})) if (!seenKey.has(k)) { seenKey.add(k); keys.push(k); }
+  const info = new Map(keys.map(k => [k, { num: true, any: 0, dates: 0, seen: new Map() }]));
+  for (const f of features) {
+    const p = f.properties || {};
+    for (const k of keys) {
+      const v = p[k];
+      if (v === null || v === undefined || v === '') continue;
+      const I = info.get(k);
+      I.any++;
+      if (typeof v !== 'number') I.num = false;
+      if (typeof v === 'string' && DATE_RE.test(v)) I.dates++;
+      if (I.seen.size <= 100) { const s = typeof v === 'object' ? JSON.stringify(v) : String(v); I.seen.set(s, (I.seen.get(s) || 0) + 1); }
+    }
+  }
+  const names = cleanNames(keys);
+  const cols = keys.map(k => {
+    const I = info.get(k);
+    const kind = I.any && I.num ? 'num' : I.any && I.dates >= 0.9 * I.any ? 'date' : 'str';
+    const values = [...I.seen.entries()].sort((a, b) => b[1] - a[1]).map(e => e[0]);
+    return { name: names.get(k), src: k, kind, distinct: I.seen.size, values: I.seen.size <= 100 ? values : [] };
+  });
+
+  const bbox = new Float64Array(features.length * 4);
+  const out = new Array(features.length);
+  let area = 0, len = 0, gx0 = Infinity, gy0 = Infinity, gx1 = -Infinity, gy1 = -Infinity;
+  for (let i = 0; i < features.length; i++) {
+    const p = features[i].properties || {}, m = meas[i], props = { fid: i };
+    for (const c of cols) {
+      const v = p[c.src];
+      props[c.name] = (v === null || v === undefined || v === '') ? null
+        : c.kind === 'num' ? v : (typeof v === 'object' ? JSON.stringify(v) : String(v));
+    }
+    props._area_km2 = m.area / 1e6;
+    props._len_km = m.len / 1000;
+    area += m.area; len += m.len;
+    bbox.set(m.bbox, i * 4);
+    gx0 = Math.min(gx0, m.bbox[0]); gy0 = Math.min(gy0, m.bbox[1]); gx1 = Math.max(gx1, m.bbox[2]); gy1 = Math.max(gy1, m.bbox[3]);
+    out[i] = { type: 'Feature', geometry: features[i].geometry, properties: props };
+  }
+  if (gx0 < -180.0001 || gx1 > 180.0001 || gy0 < -90.0001 || gy1 > 90.0001) {
+    const e = new Error(`Coordinates run from ${gx0.toFixed(0)} to ${gx1.toFixed(0)}, so this layer is in a projected system rather than longitude/latitude. Use a .gpkg or a shapefile with its .prj so it can be reprojected, or re-export the layer as EPSG:4326.`);
+    e.code = 'CRS';
+    throw e;
+  }
+  // identifiers (id, OBJECTID, parcel_id, ...) are numbers but make a poor default measure, so they go last
+  const idLike = n => /(^|_)(o?id|fid|gid|objectid|code|no|num)$/i.test(n) || /^objectid/i.test(n);
+  const numFields = cols.filter(c => c.kind === 'num').sort((a, b) => idLike(a.name) - idLike(b.name)).map(c => c.name);
+  if (area > 0) numFields.push('_area_km2');
+  if (len > 0) numFields.push('_len_km');
+  // text fields with 2 to 100 values; ones with at most 12 groups come first, so the default chart stays readable
+  const catFields = cols.filter(c => c.kind === 'str' && c.distinct >= 2 && c.distinct <= 100)
+    .sort((a, b) => (a.distinct > 12) - (b.distinct > 12)).map(c => c.name);
+  const dateFields = cols.filter(c => c.kind === 'date').map(c => c.name);
+  return { fc: { type: 'FeatureCollection', features: out }, bbox, cols, catFields, numFields, dateFields, extent: [gx0, gy0, gx1, gy1] };
+}
+
+/* time buckets (timestamps are handled as UTC milliseconds throughout) */
+const DAY = 864e5;
+function autoInterval(lo, hi) { const d = (hi - lo) / DAY; return d > 365 * 3 ? 'year' : d > 150 ? 'month' : d > 35 ? 'week' : d > 2 ? 'day' : 'hour'; }
+function nextBucket(t, iv) {
+  const d = new Date(t);
+  if (iv === 'year') return Date.UTC(d.getUTCFullYear() + 1, 0, 1);
+  if (iv === 'month') return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1);
+  return t + (iv === 'week' ? 7 * DAY : iv === 'day' ? DAY : 36e5);
+}
+function bucketLabel(t, iv) {
+  const d = new Date(t), o = { timeZone: 'UTC' };
+  if (iv === 'year') return String(d.getUTCFullYear());
+  if (iv === 'month') return d.toLocaleDateString(undefined, { ...o, month: 'short', year: 'numeric' });
+  if (iv === 'hour') return d.toLocaleString(undefined, { ...o, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  return (iv === 'week' ? 'Week of ' : '') + d.toLocaleDateString(undefined, { ...o, day: 'numeric', month: 'short', year: 'numeric' });
+}
+const DOW = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const CYCLES = {
+  hour: { expr: f => `hour(${qid(f)})`, keys: [...Array(24).keys()], label: k => String(k).padStart(2, '0') + ':00' },
+  dow: { expr: f => `isodow(${qid(f)})`, keys: [1, 2, 3, 4, 5, 6, 7], label: k => DOW[k - 1] },
+  month: { expr: f => `month(${qid(f)})`, keys: [...Array(12).keys()].map(i => i + 1), label: k => MONTHS[k - 1] }
+};
+
+function ticks(min, max, count) {
+  const span = max - min;
+  if (!(span > 0)) return { values: [], dec: 0 };
+  const raw = span / count, p = Math.pow(10, Math.floor(Math.log10(raw))), m = raw / p;
+  const step = (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p;
+  const dec = Math.max(0, -Math.floor(Math.log10(step) + 1e-9));
+  const values = [];
+  for (let i = Math.ceil(min / step); i * step <= max; i++) values.push(Number((i * step).toFixed(dec + 1)));
+  return { values, dec };
+}
+const degLabel = (v, dec, pos, neg) => `${Math.abs(v).toFixed(dec)}°${v >= 0 ? pos : neg}`;
+
+const fmtInt = v => (v == null || !Number.isFinite(v)) ? '–' : new Intl.NumberFormat().format(Math.round(v));
+function fmt(v) {
+  if (v == null || !Number.isFinite(v)) return '–';
+  const a = Math.abs(v);
+  if (a >= 1e6) return new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 2 }).format(v);
+  if (a >= 100) return new Intl.NumberFormat().format(Math.round(v));
+  return new Intl.NumberFormat(undefined, { maximumSignificantDigits: 3 }).format(v);
+}
+
+/* Dark basemap from the light one: every colour in a layer's paint is re-lit. Areas and lines
+   keep their order (roads stay lighter than land, water darker) in a low lightness band;
+   text and icon colours are inverted so labels stay readable. */
+function parseColor(s) {
+  if (typeof s !== 'string') return null;
+  let m = /^#([0-9a-f]{3,8})$/i.exec(s.trim());
+  if (m) {
+    let h = m[1];
+    if (h.length === 3 || h.length === 4) h = [...h].map(c => c + c).join('');
+    if (h.length !== 6 && h.length !== 8) return null;
+    return [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16)).concat(h.length === 8 ? parseInt(h.slice(6), 16) / 255 : 1);
+  }
+  m = /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)$/i.exec(s.trim());
+  return m ? [+m[1], +m[2], +m[3], m[4] == null ? 1 : +m[4]] : null;
+}
+function relight(s, invert) {
+  const c = parseColor(s);
+  if (!c) return s;
+  const [r, g, b] = c.slice(0, 3).map(v => v / 255), mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2, d = mx - mn;
+  let h = 0, sat = 0;
+  if (d) {
+    sat = d / (1 - Math.abs(2 * l - 1));
+    h = mx === r ? (g - b) / d : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    h = ((h % 6) + 6) % 6;
+  }
+  const L = invert ? 1 - l * 0.78 : 0.06 + l * l * 0.3, S2 = sat * (invert ? 0.5 : 0.45);
+  const C = (1 - Math.abs(2 * L - 1)) * S2, X = C * (1 - Math.abs(h % 2 - 1)), M = L - C / 2;
+  const [r1, g1, b1] = h < 1 ? [C, X, 0] : h < 2 ? [X, C, 0] : h < 3 ? [0, C, X] : h < 4 ? [0, X, C] : h < 5 ? [X, 0, C] : [C, 0, X];
+  return `rgba(${Math.round((r1 + M) * 255)}, ${Math.round((g1 + M) * 255)}, ${Math.round((b1 + M) * 255)}, ${c[3]})`;
+}
+function darkLayer(layer) {
+  const walk = (v, inv) => Array.isArray(v) ? v.map(x => walk(x, inv)) : relight(v, inv);
+  const paint = {};
+  for (const [k, v] of Object.entries(layer.paint || {})) paint[k] = /^(text|icon)-/.test(k) ? walk(v, true) : walk(v, false);
+  return { ...layer, id: 'dk-' + layer.id, paint };
+}
+
+/* CSV that Excel opens correctly: UTF-8 with a byte-order mark, quoted where needed */
+const csvCell = v => { if (v == null) return ''; const s = String(v); return /[",\r\n]/.test(s) || /^\s|\s$/.test(s) ? '"' + s.replaceAll('"', '""') + '"' : s; };
+const toCsv = (head, rows) => '﻿' + [head, ...rows].map(r => r.map(csvCell).join(',')).join('\r\n') + '\r\n';
+
+/* A starting dashboard for any dataset: headline figures, then the map between a group
+   chart and a feature list, then distribution / time / share charts. Every widget can be
+   changed afterwards; this is only the first draft. */
+function autoDashboard(ds) {
+  const cols = new Map(ds.cols.map(c => [c.name, c]));
+  const cat = ds.catFields[0], cat2 = ds.catFields[1], num = ds.numFields[0], date = ds.dateFields[0];
+  const small = ds.cols.filter(c => c.kind === 'str' && c.distinct >= 2 && c.distinct <= 6).sort((a, b) => a.distinct - b.distinct)[0];
+  const title = ds.cols.find(c => c.kind === 'str' && c.distinct > 12) || cols.get(cat);
+  let n = 0;
+  const id = () => 'w' + (++n);
+  const W = [{ id: id(), type: 'indicator', w: 3, h: 2, stat: 'count', onClick: 'zoom' }];
+  if (num) W.push({ id: id(), type: 'indicator', w: 3, h: 2, stat: 'sum', field: num, reference: 'all', onClick: 'zoom' });
+  if (num) W.push({ id: id(), type: 'indicator', w: small ? 3 : 6, h: 2, stat: 'max', field: num, onClick: 'locate' });
+  if (small) W.push({ id: id(), type: 'gauge', w: 3, h: 2, field: small.name, value: small.values[0], onClick: 'filter' });
+  if (cat) W.push({ id: id(), type: 'category', w: 3, h: 7, field: cat, chart: 'bar', onClick: 'filter' });
+  W.push({ id: 'map', type: 'map', w: cat ? 6 : 9, h: 7, shade: cat ? 'category' : num ? 'measure' : 'none', shadeField: cat || num || null });
+  W.push({ id: id(), type: 'list', w: 3, h: 7, titleField: title ? title.name : 'fid', subField: cat && title && title.name !== cat ? cat : null, sortField: num || 'fid', order: 'desc', onClick: 'locate' });
+  if (num) W.push({ id: id(), type: 'histogram', w: 4, h: 4, field: num, onClick: 'filter' });
+  if (date) W.push({ id: id(), type: 'time', w: cat2 ? 5 : 8, h: 4, field: date, onClick: 'filter' });
+  if (cat2) W.push({ id: id(), type: 'category', w: date ? 3 : 4, h: 4, field: cat2, chart: 'donut', onClick: 'filter' });
+  else if (!date && cat) W.push({ id: id(), type: 'category', w: 4, h: 4, field: cat, chart: 'donut', onClick: 'highlight' });
+  return { version: 1, title: 'Layer dashboard', widgets: W };
+}
+
+/* Synthetic parcels in Riyadh so the dashboard can be tried without any data. */
+function sampleFeatures() {
+  let s = 20240607;
+  const rnd = () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296;
+  const NX = 44, NY = 32, x0 = 46.66, y0 = 24.68, dx = 0.0022, dy = 0.0019;
+  const feats = [];
+  let n = 0;
+  for (let i = 0; i < NX; i++) for (let j = 0; j < NY; j++) {
+    if (rnd() < 0.06) continue;
+    const d = Math.hypot((i - NX / 2) / NX * 1.6, (j - NY / 2) / NY * 1.6);
+    const r = rnd();
+    const use = d < 0.22 ? (r < .6 ? 'Commercial' : r < .9 ? 'Mixed use' : 'Residential')
+      : d < 0.55 ? (r < .45 ? 'Residential' : r < .75 ? 'Mixed use' : r < .9 ? 'Commercial' : 'Open space')
+      : (r < .4 ? 'Residential' : r < .7 ? 'Industrial' : 'Open space');
+    const zone = 'Zone ' + 'ABCDEF'[Math.floor(i / NX * 3) + 3 * Math.floor(j / NY * 2)];
+    const m = () => 0.08 + rnd() * 0.16, k = () => (rnd() - .5) * 0.15 * dx;
+    const xa = x0 + (i + m()) * dx, xb = x0 + (i + 1 - m()) * dx, ya = y0 + (j + m()) * dy, yb = y0 + (j + 1 - m()) * dy;
+    const ring = [[xa + k(), ya + k()], [xb + k(), ya + k()], [xb + k(), yb + k()], [xa + k(), yb + k()]];
+    ring.push(ring[0].slice());
+    const base = use === 'Commercial' ? 22 : use === 'Mixed use' ? 12 : use === 'Industrial' ? 2 : 5;
+    const floors = use === 'Open space' ? 0 : Math.max(1, Math.round(base * (0.4 + rnd() * 1.2) * (1.1 - d * 0.6)));
+    const year = Math.min(2024, Math.round(1988 + (1 - d) * 20 * rnd() + rnd() * 16));
+    const value = +((use === 'Open space' ? 0.3 : 1) * (floors + 1) * (0.6 + rnd() * 0.8) * (1.4 - d) * 2.1).toFixed(2);
+    const r2 = rnd(), status = r2 < .55 ? 'Approved' : r2 < .8 ? 'Pending' : 'Under review';
+    const hour = Math.min(20, 7 + Math.floor(rnd() * 8 + rnd() * 6)), day = Math.floor(rnd() * rnd() * 730);
+    const reported = new Date(Date.UTC(2024, 0, 1) + day * DAY + hour * 36e5 + Math.floor(rnd() * 60) * 6e4).toISOString().slice(0, 19).replace('T', ' ');
+    feats.push({
+      type: 'Feature', geometry: { type: 'Polygon', coordinates: [ring] },
+      properties: { parcel_id: 'P-' + String(++n).padStart(4, '0'), zone, land_use: use, permit_status: status, floors, year_built: year, value_sar_m: value, reported }
+    });
+  }
+  return feats;
+}
+// </pure>
+
+/* Minimal ZIP reader (stored + deflate) on the browser's built-in DecompressionStream,
+   so zipped shapefiles need no extra library. Returns [{ name, data: Uint8Array }]. */
+async function unzip(buf) {
+  const u8 = new Uint8Array(buf), dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  let eocd = -1;
+  for (let i = u8.length - 22; i >= Math.max(0, u8.length - 65557); i--) if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  if (eocd < 0) throw new Error('This .zip file could not be read (no ZIP directory found).');
+  const count = dv.getUint16(eocd + 10, true);
+  let p = dv.getUint32(eocd + 16, true);
+  if (p === 0xffffffff) throw new Error('ZIP64 archives (over 4 GB) are not supported. Convert the layer to GeoPackage instead.');
+  const out = [];
+  for (let k = 0; k < count; k++) {
+    if (dv.getUint32(p, true) !== 0x02014b50) throw new Error('This .zip file is damaged.');
+    const flags = dv.getUint16(p + 8, true), method = dv.getUint16(p + 10, true), size = dv.getUint32(p + 20, true);
+    const nl = dv.getUint16(p + 28, true), xl = dv.getUint16(p + 30, true), cl = dv.getUint16(p + 32, true), off = dv.getUint32(p + 42, true);
+    const name = new TextDecoder().decode(u8.subarray(p + 46, p + 46 + nl));
+    p += 46 + nl + xl + cl;
+    if (name.endsWith('/') || /(^|\/)(__MACOSX|\.)/.test(name)) continue;
+    if (flags & 1) throw new Error('Password-protected ZIP files are not supported.');
+    const start = off + 30 + dv.getUint16(off + 26, true) + dv.getUint16(off + 28, true), raw = u8.subarray(start, start + size);
+    let data;
+    if (method === 0) data = raw.slice();
+    else if (method === 8) data = new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer());
+    else throw new Error(`ZIP entry ${name} uses an unsupported compression method (${method}).`);
+    out.push({ name, data });
+  }
+  return out;
+}
+
+/* ================================================================
+   2. STATE
+   ================================================================ */
+const CONFIG = {
+  // Where DuckDB looks for its "spatial" extension. get-libs.mjs saves it under ./lib/ext,
+  // so nothing is downloaded at run time. Set to '' to use extensions.duckdb.org instead.
+  extensionRepo: new URL('./lib/ext', location.href).href
+};
+const $ = id => document.getElementById(id);
+const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
+const SVGNS = 'http://www.w3.org/2000/svg';
+const svgEl = (tag, attrs = {}) => { const n = document.createElementNS(SVGNS, tag); for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v); return n; };
+const EMPTY_FC = { type: 'FeatureCollection', features: [] };
+
+const S = {
+  map: null, mapReady: false, baseLayers: { none: [] }, duck: null, db: null, conn: null, dbPromise: null, mapLoaded: null, platform: null,
+  spatial: undefined, spatialError: '', gdalPromise: null, files: [], fileSeq: 0, src: null, layers: [],
+  fc: null, bbox: null, ds: null, n: 0, sig: null,
+  dash: null, shared: null,             // current layout; dashboard.json next to the page, if any
+  filters: new Map(),                   // source id -> { sql, text }   (widget ids, 'box', 'map')
+  sel: new Map(),                       // widget id -> Map(key -> label) of selected items
+  hl: null,                             // { src, key, ids } highlighted on the map by a widget
+  pick: null, hover: null, popup: null, // picked feature (popup), hovered list row
+  data: new Map(), bodies: new Map(),   // last query result and body element per widget
+  cache: new Map(), colors: new Map(),  // query results that ignore filters; colours per field
+  extent: null, boxMode: false, boxAt: 0, mapFiltered: false, seq: 0, editing: false, legend: null,
+  range: new Map(),                     // selector widget id -> [lo, hi] of a number or date range
+  detail: new Map(),                    // details widget id -> position among the filtered features
+  maxId: null                           // widget shown maximized, if any
+};
+/* current theme colour, for SVG and map paint that cannot use CSS variables */
+const cssVar = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const isDark = () => document.documentElement.dataset.theme === 'dark';
+const icon = (name, cls) => { const s = svgEl('svg', { class: 'ic' + (cls ? ' ' + cls : ''), 'aria-hidden': 'true' }); s.append(svgEl('use', { href: '#i-' + name })); return s; };
+
+/* one DuckDB connection: run queries one at a time */
+let chain = Promise.resolve();
+const enqueue = fn => { const p = chain.then(fn); chain = p.then(() => {}, () => {}); return p; };
+const q = sql => enqueue(async () => {
+  try {
+    const t = await S.conn.query(sql);
+    return t.toArray().map(r => {
+      const o = {};
+      for (const f of t.schema.fields) { const v = r[f.name]; o[f.name] = typeof v === 'bigint' ? Number(v) : v; }
+      return o;
+    });
+  } catch (e) { console.error('SQL failed:', sql, e); throw e; }
+});
+const qTable = sql => enqueue(() => S.conn.query(sql));
+/* results that do not depend on filters (unfiltered totals, field ranges) are computed once */
+const cached = sql => { if (!S.cache.has(sql)) S.cache.set(sql, q(sql)); return S.cache.get(sql); };
+
+/* ================================================================
+   3. MESSAGES AND TOOLTIP
+   ================================================================ */
+function notify(text, kind = 'info', ms = 4200) {
+  const m = $('msg');
+  m.replaceChildren();
+  if (kind === 'info' && !ms) m.append(el('span', 'spin'));     // work in progress
+  m.append(el('span', null, text));
+  m.className = kind; m.hidden = false;
+  clearTimeout(notify.t);
+  if (kind !== 'err' && ms) notify.t = setTimeout(() => { m.hidden = true; }, ms);
+}
+const fail = e => { console.error(e); notify(String(e && e.message || e).slice(0, 400), 'err'); };
+const setWindowTitle = () => { if (window.desktop && S.dash) window.desktop.setTitle(S.dash.title); };
+
+function showTip(e, text) {
+  const t = $('tip');
+  t.textContent = text; t.hidden = false;
+  const x = Math.min(e.clientX + 14, innerWidth - t.offsetWidth - 8);
+  const y = e.clientY + 18 + t.offsetHeight > innerHeight ? e.clientY - t.offsetHeight - 10 : e.clientY + 18;
+  t.style.left = Math.max(8, x) + 'px'; t.style.top = y + 'px';
+}
+const hideTip = () => { $('tip').hidden = true; };
+function tipOn(node, text) {
+  node.addEventListener('pointermove', e => { if (e.pointerType === 'mouse') showTip(e, text); });
+  node.addEventListener('pointerleave', hideTip);
+  node.setAttribute('aria-label', text.replace(/\n/g, ', '));
+}
+
+/* ================================================================
+   4. MAP
+   ================================================================ */
+/* Basemaps, all declared up front and switched by layer visibility (so the data layers stay):
+   - offline: vector tiles from lib/basemap/basemap.pmtiles (area cut by get-libs.mjs), with
+     local fonts and icons; nothing leaves the machine
+   - osm:     OpenStreetMap raster tiles; the only option that uses the internet, and MapLibre
+              requests tiles only while it is selected
+   - none:    plain background */
+const lib = p => new URL('./lib/' + p, location.href).href;
+async function basemapStyle() {
+  const style = {
+    version: 8, layers: [{ id: 'bg', type: 'background', paint: { 'background-color': '#d7e5e9' } }],
+    sources: {
+      osm: { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256, maxzoom: 19, attribution: '© OpenStreetMap contributors' }
+    }
+  };
+  style.layers.push({ id: 'osm', type: 'raster', source: 'osm', layout: { visibility: 'none' } });
+  S.baseLayers = { osm: ['osm'], offline: [], 'offline-dark': [], none: [] };
+  if (!window.pmtiles) return style;
+  try {
+    const res = await fetch(lib('basemap/layers.json'));
+    if (!res.ok) return style;
+    const layers = await res.json();
+    const protocol = new pmtiles.Protocol(), url = lib('basemap/basemap.pmtiles');
+    // PMTiles reads byte ranges. IIS, nginx and Apache support that; "python -m http.server"
+    // does not, so in that case read the whole file once (it is small) and slice it in memory.
+    const probe = await fetch(url, { headers: { Range: 'bytes=0-15' } });
+    if (!probe.ok) return style;
+    if (probe.status !== 206) {
+      probe.body && probe.body.cancel();
+      let whole = null;
+      protocol.add(new pmtiles.PMTiles({
+        getKey: () => url,
+        getBytes: async (offset, length) => {
+          whole = whole || fetch(url).then(r => r.arrayBuffer());
+          return { data: (await whole).slice(offset, offset + length) };
+        }
+      }));
+    }
+    maplibregl.addProtocol('pmtiles', protocol.tile);
+    maplibregl.setRTLTextPlugin(lib('rtl-text.js'), true);        // shapes Arabic labels, loaded on demand
+    style.glyphs = lib('basemap/fonts/') + '{fontstack}/{range}.pbf';   // not via URL(): it would escape the {tokens}
+    style.sprite = lib('basemap/sprites/light');
+    style.sources.protomaps = { type: 'vector', url: 'pmtiles://' + url, attribution: '© OpenStreetMap contributors, Protomaps' };
+    for (const l of layers) { l.layout = { ...(l.layout || {}), visibility: 'none' }; style.layers.push(l); S.baseLayers.offline.push(l.id); }
+    for (const l of layers.map(darkLayer)) { style.layers.push(l); S.baseLayers['offline-dark'].push(l.id); }
+  } catch (e) { console.warn('Offline basemap not available', e); }
+  return style;
+}
+
+function setBasemap(name) {
+  if (!S.baseLayers[name] || (/^offline/.test(name) && !S.baseLayers.offline.length)) name = 'none';
+  for (const [k, ids] of Object.entries(S.baseLayers))
+    for (const id of ids) S.map.setLayoutProperty(id, 'visibility', k === name ? 'visible' : 'none');
+  $('baseSel').value = name;
+  try { localStorage.setItem('basemap', name); } catch (e) { /* storage blocked: fine */ }
+}
+
+/* map colours that depend on the theme: plain background, feature outlines */
+function applyMapTheme() {
+  if (!S.map || !S.map.getLayer('poly-line')) return;
+  const dark = isDark();
+  S.map.setPaintProperty('bg', 'background-color', dark ? '#1a232d' : '#d7e5e9');
+  S.map.setPaintProperty('poly-line', 'line-color', dark ? '#0b0e12' : '#142536');
+  S.map.setPaintProperty('pt', 'circle-stroke-color', dark ? '#0b0e12' : '#142536');
+}
+
+function setTheme(t) {
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem('theme', t); } catch (e) { /* storage blocked */ }
+  const dark = t === 'dark';
+  $('themeBtn').replaceChildren(icon(dark ? 'sun' : 'moon'));
+  $('themeBtn').title = dark ? 'Switch to the light theme' : 'Switch to the dark theme';
+  if (window.desktop && window.desktop.setTheme) window.desktop.setTheme(t);
+  if (!S.mapReady) return;
+  const cur = $('baseSel').value;
+  if (/^offline/.test(cur)) setBasemap(dark ? 'offline-dark' : 'offline');
+  applyMapTheme();
+  renderAll();
+}
+
+function initMap(style) {
+  const map = new maplibregl.Map({
+    container: 'map', style,
+    center: [46.66, 24.72], zoom: 10, attributionControl: { compact: true },
+    dragRotate: false, pitchWithRotate: false, maxPitch: 0
+  });
+  map.touchZoomRotate.disableRotation();
+  map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right');
+  map.addControl(new maplibregl.ScaleControl({ maxWidth: 110, unit: 'metric' }), 'bottom-right');
+  S.map = map;
+  S.mapLoaded = new Promise(res => map.on('load', () => {
+    addLayers();
+    let saved = null;
+    try { saved = localStorage.getItem('basemap'); } catch (e) { /* storage blocked */ }
+    for (const v of ['offline', 'offline-dark']) $('baseSel').querySelector(`[value=${v}]`).disabled = !S.baseLayers.offline.length;
+    if (/^offline/.test(saved || 'offline')) saved = isDark() ? 'offline-dark' : 'offline';    // streets follow the theme
+    setBasemap(saved);
+    S.mapReady = true; applyMapTheme(); updateFrame(); res();
+  }));
+  map.on('move', updateFrame);
+  map.on('resize', updateFrame);
+  map.on('moveend', onMapMoved);
+  new ResizeObserver(() => map.resize()).observe($('map'));
+
+  map.on('click', e => {
+    if (S.boxMode || performance.now() - S.boxAt < 400 || !S.fc) return;
+    const r = 5;
+    const hit = map.queryRenderedFeatures([[e.point.x - r, e.point.y - r], [e.point.x + r, e.point.y + r]], { layers: ['poly-fill', 'line', 'pt'] })[0];
+    mapClicked(hit ? hit.properties.fid : null);
+  });
+  for (const id of ['poly-fill', 'line', 'pt']) {
+    map.on('mouseenter', id, () => { if (!S.boxMode && mapCfg().onClick !== 'none') map.getCanvas().style.cursor = 'pointer'; });
+    map.on('mouseleave', id, () => { map.getCanvas().style.cursor = ''; });
+  }
+}
+
+function addLayers() {
+  const m = S.map;
+  const T = (...t) => ['in', ['geometry-type'], ['literal', t]];
+  const polys = T('Polygon', 'MultiPolygon'), lines = T('LineString', 'MultiLineString'), pts = T('Point', 'MultiPoint');
+  m.addSource('data', { type: 'geojson', data: EMPTY_FC });
+  m.addSource('box', { type: 'geojson', data: EMPTY_FC });
+  m.addLayer({ id: 'poly-fill', type: 'fill', source: 'data', filter: polys, paint: { 'fill-color': CAT_COLORS[0], 'fill-opacity': 0.8 } });
+  m.addLayer({ id: 'poly-line', type: 'line', source: 'data', filter: polys, paint: { 'line-color': '#142536', 'line-width': 0.5, 'line-opacity': 0.55 } });
+  m.addLayer({ id: 'line', type: 'line', source: 'data', filter: lines, paint: { 'line-color': CAT_COLORS[0], 'line-width': 2.2 } });
+  m.addLayer({ id: 'pt', type: 'circle', source: 'data', filter: pts, paint: { 'circle-color': CAT_COLORS[0], 'circle-radius': 5, 'circle-stroke-width': 1, 'circle-stroke-color': '#142536' } });
+  // highlight: picked feature, hovered list row, or a widget's "highlight on map" selection
+  const none = ['==', ['get', 'fid'], -1];
+  m.addLayer({ id: 'hl-fill', type: 'fill', source: 'data', filter: none, paint: { 'fill-color': '#d4198a', 'fill-opacity': 0.3 } });
+  m.addLayer({ id: 'hl-line', type: 'line', source: 'data', filter: none, paint: { 'line-color': '#d4198a', 'line-width': 3.5 } });
+  m.addLayer({ id: 'hl-pt', type: 'circle', source: 'data', filter: none, paint: { 'circle-color': '#d4198a', 'circle-radius': 8, 'circle-stroke-width': 2, 'circle-stroke-color': '#ffffff' } });
+  // selection rectangle
+  m.addLayer({ id: 'box-fill', type: 'fill', source: 'box', paint: { 'fill-color': '#d4198a', 'fill-opacity': 0.07 } });
+  m.addLayer({ id: 'box-line', type: 'line', source: 'box', paint: { 'line-color': '#d4198a', 'line-width': 2, 'line-dasharray': [3, 2] } });
+}
+
+function updateHighlight() {
+  if (!S.mapReady) return;
+  const ids = new Set();
+  if (S.pick != null) ids.add(S.pick);
+  if (S.hover != null) ids.add(S.hover);
+  if (S.hl) for (const i of S.hl.ids) ids.add(i);
+  const m = S.map, has = ['in', ['get', 'fid'], ['literal', [...ids]]], gt = (...t) => ['in', ['geometry-type'], ['literal', t]];
+  m.setFilter('hl-fill', ['all', gt('Polygon', 'MultiPolygon'), has]);
+  m.setFilter('hl-line', ['all', gt('Polygon', 'MultiPolygon', 'LineString', 'MultiLineString'), has]);
+  m.setFilter('hl-pt', ['all', gt('Point', 'MultiPoint'), has]);
+}
+
+/* colours per text field, by the field's overall ranking, so a value keeps its colour
+   whatever is filtered (colour follows the entity, never its rank in the current view) */
+async function colorsFor(field) {
+  if (!S.colors.has(field)) {
+    const rows = await cached(sqlCats(field, 'TRUE'));
+    const map = new Map(rows.slice(0, CAT_COLORS.length).map((r, i) => [r.k, CAT_COLORS[i]]));
+    S.colors.set(field, { map, rows, more: rows.length > CAT_COLORS.length });
+  }
+  return S.colors.get(field);
+}
+const colorOf = (field, k) => (S.colors.get(field) && S.colors.get(field).map.get(k)) || OTHER_COLOR;
+const rangeFor = field => cached(`SELECT CAST(MIN(${qid(field)}) AS DOUBLE) AS lo, CAST(MAX(${qid(field)}) AS DOUBLE) AS hi FROM f`).then(r => r[0]);
+
+/* shade the map as the map widget's settings say: by a text field or a number field */
+async function applyColors() {
+  if (!S.fc || !S.mapReady) return;
+  const cfg = mapCfg(), f = cfg.shadeField && hasField(cfg.shadeField) ? cfg.shadeField : null;
+  let expr = CAT_COLORS[0];
+  S.legend = null;
+  if (cfg.shade === 'measure' && f) {
+    let { lo, hi } = await rangeFor(f);
+    if (lo == null) { lo = 0; hi = 1; }
+    if (hi === lo) hi = lo + 1;
+    expr = ['interpolate', ['linear'], ['to-number', ['get', f], lo], lo, RAMP[0], lo + (hi - lo) / 2, RAMP[1], hi, RAMP[2]];
+    S.legend = { type: 'ramp', lo, hi, field: f };
+  } else if (cfg.shade === 'category' && f) {
+    const c = await colorsFor(f);
+    const pairs = [...c.map.entries()];
+    if (pairs.length) expr = ['match', ['to-string', ['coalesce', ['get', f], '(blank)']], ...pairs.flat(), OTHER_COLOR];
+    S.legend = { type: 'cat', items: pairs, more: c.more, field: f };
+  }
+  for (const [id, prop] of [['poly-fill', 'fill-color'], ['line', 'line-color'], ['pt', 'circle-color']]) S.map.setPaintProperty(id, prop, expr);
+  renderLegend();
+}
+
+function renderLegend() {
+  const box = $('legend'), L = S.legend;
+  box.replaceChildren();
+  box.hidden = !L || mapCfg().legend === false;
+  if (box.hidden) return;
+  box.append(el('div', 'lt', label(L.field)));
+  if (L.type === 'cat') {
+    for (const [k, c] of L.items) { const row = el('div'); const sw = el('i'); sw.style.background = c; row.append(sw, k); box.append(row); }
+    if (L.more) { const row = el('div'); const sw = el('i'); sw.style.background = OTHER_COLOR; row.append(sw, 'Other values'); box.append(row); }
+  } else {
+    const ramp = el('div', 'ramp'); ramp.style.background = `linear-gradient(90deg,${RAMP.join(',')})`;
+    const ends = el('div', 'ends'); ends.append(el('span', null, fmt(L.lo)), el('span', null, fmt(L.hi)));
+    box.append(ramp, ends);
+  }
+}
+
+/* neatline coordinates around the map, like a printed sheet */
+function updateFrame() {
+  const m = S.map;
+  if (!m || !S.mapReady) return;
+  const b = m.getBounds(), c = m.getCenter(), cont = m.getContainer();
+  const fx = $('frameX'), fy = $('frameY');
+  fx.replaceChildren(); fy.replaceChildren();
+  if (!cont.clientWidth || !$('mapwrap').classList.contains('framed')) return;
+  const lon = ticks(b.getWest(), b.getEast(), Math.max(2, Math.floor(cont.clientWidth / 120)));
+  for (const t of lon.values) { const s = el('span', null, degLabel(t, lon.dec, 'E', 'W')); s.style.left = (m.project([t, c.lat]).x + 2) + 'px'; fx.append(s); }
+  const lat = ticks(b.getSouth(), b.getNorth(), Math.max(2, Math.floor(cont.clientHeight / 90)));
+  for (const t of lat.values) { const s = el('span', null, degLabel(t, lat.dec, 'N', 'S')); s.style.top = (m.project([c.lng, t]).y + 2) + 'px'; fy.append(s); }
+}
+
+function fitTo(b) {
+  if (b[0] === b[2] && b[1] === b[3]) S.map.flyTo({ center: [b[0], b[1]], zoom: Math.max(S.map.getZoom(), 16) });
+  else S.map.fitBounds([[b[0], b[1]], [b[2], b[3]]], { padding: 40, maxZoom: 18, duration: 500 });
+}
+async function zoomToWhere(where) {
+  const r = (await q(sqlExtent(where)))[0];
+  if (r && r.x0 != null) fitTo([r.x0, r.y0, r.x1, r.y1]);
+  else notify('No features match.');
+}
+
+/* widgets that follow the map view refresh when the map stops moving */
+function onMapMoved() {
+  if (!S.fc) return;
+  const b = S.map.getBounds();
+  S.extent = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
+  if (S.dash.widgets.some(w => w.followExtent)) scheduleRefresh(false);
+}
+
+function updateMap(ids) {
+  const src = S.map.getSource('data');
+  if (!ids) { if (S.mapFiltered) { src.setData(S.fc); S.mapFiltered = false; } return; }
+  src.setData({ type: 'FeatureCollection', features: Array.from(ids, i => S.fc.features[i]) });
+  S.mapFiltered = true;
+}
+
+/* ---- picking a single feature ---- */
+/* the field that names a feature (the list widget's title, else a text field with many values) */
+function nameField() {
+  const lw = S.dash && S.dash.widgets.find(w => w.type === 'list');
+  if (lw && lw.titleField && lw.titleField !== 'fid' && kindOf(lw.titleField) === 'str' && hasField(lw.titleField)) return lw.titleField;
+  return (S.ds.cols.find(c => c.kind === 'str' && c.distinct > 12) || S.ds.cols.find(c => c.kind === 'str') || {}).name || null;
+}
+function closePopup() { if (S.popup) { const p = S.popup; S.popup = null; p.remove(); } }
+
+function showPopup(fid) {
+  const props = S.fc.features[fid].properties;
+  const box = S.bbox.subarray(4 * fid, 4 * fid + 4);
+  const wrap = el('div', 'pop');
+  const tf = nameField();
+  wrap.append(el('h3', null, tf && props[tf] != null && props[tf] !== '' ? String(props[tf]) : 'Feature ' + fid));
+  const dl = el('dl');
+  for (const [k, v] of Object.entries(props)) {
+    if (k === 'fid') continue;
+    // whole numbers as stored (years, codes and IDs must not get thousands separators)
+    dl.append(el('dt', null, label(k)), el('dd', null, v == null ? '' : typeof v === 'number' && !Number.isInteger(v) ? fmt(v) : String(v)));
+  }
+  wrap.append(dl);
+  const p = new maplibregl.Popup({ closeOnClick: false, maxWidth: '300px' })
+    .setLngLat([(box[0] + box[2]) / 2, (box[1] + box[3]) / 2]).setDOMContent(wrap).addTo(S.map);
+  p.on('close', () => { if (S.popup === p) { S.popup = null; S.pick = null; updateHighlight(); renderAll(); } });
+  S.popup = p;
+}
+
+function pick(fid, opts = {}) {
+  S.pick = fid;
+  closePopup();
+  updateHighlight();
+  if (fid != null) {
+    if (opts.popup !== false) showPopup(fid);
+    if (opts.fly) fitTo(Array.from(S.bbox.subarray(4 * fid, 4 * fid + 4)));
+  }
+  renderAll();
+}
+
+/* the map widget's "When a feature is clicked" setting */
+function mapClicked(fid) {
+  const how = mapCfg().onClick || 'popup';
+  if (how === 'none') return;
+  if (how === 'filter') {
+    if (fid == null || (S.filters.get('map') || {}).fid === fid) S.filters.delete('map');
+    else S.filters.set('map', { sql: `fid = ${nz(fid)}`, text: `Map: feature ${fid}`, fid });
+    pick(fid, { popup: false });
+    refresh();
+    return;
+  }
+  pick(fid);
+}
+
+/* ---- rectangle selection (one-shot tool, works with touch and mouse) ---- */
+function setBoxMode(on) {
+  S.boxMode = on;
+  $('boxBtn').setAttribute('aria-pressed', String(on));
+  $('mapbox').classList.toggle('selecting', on);
+  if (on) S.map.dragPan.disable(); else S.map.dragPan.enable();
+}
+
+function wireBoxSelect() {
+  const host = $('mapbox'), rect = $('rect');
+  let start = null;
+  const pt = e => { const r = host.getBoundingClientRect(); return { x: e.clientX - r.left - 2, y: e.clientY - r.top - 2 }; };
+  const draw = (a, b) => {
+    rect.style.left = Math.min(a.x, b.x) + 'px'; rect.style.top = Math.min(a.y, b.y) + 'px';
+    rect.style.width = Math.abs(a.x - b.x) + 'px'; rect.style.height = Math.abs(a.y - b.y) + 'px';
+  };
+  host.addEventListener('pointerdown', e => {
+    if (!S.boxMode || !e.isPrimary || e.target.closest('.maptools')) return;
+    start = pt(e); host.setPointerCapture(e.pointerId); rect.hidden = false; draw(start, start);
+  });
+  host.addEventListener('pointermove', e => { if (start) draw(start, pt(e)); });
+  host.addEventListener('pointerup', e => {
+    if (!start) return;
+    const a = start, b = pt(e);
+    start = null; rect.hidden = true; S.boxAt = performance.now();
+    if (Math.abs(a.x - b.x) < 5 && Math.abs(a.y - b.y) < 5) return;
+    const p1 = S.map.unproject([Math.min(a.x, b.x), Math.max(a.y, b.y)]);   // south-west
+    const p2 = S.map.unproject([Math.max(a.x, b.x), Math.min(a.y, b.y)]);   // north-east
+    const box = [p1.lng, p1.lat, p2.lng, p2.lat];
+    S.filters.set('box', { sql: extentSql(box), text: 'Map selection', box });
+    setBoxMode(false);
+    drawBox();
+    refresh();
+  });
+  host.addEventListener('pointercancel', () => { start = null; rect.hidden = true; });
+}
+
+function drawBox() {
+  const f = S.filters.get('box'), b = f && f.box;
+  S.map.getSource('box').setData(b
+    ? { type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [[[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]], [b[0], b[1]]]] } }
+    : EMPTY_FC);
+}
+
+/* ================================================================
+   5. DUCKDB
+   ================================================================ */
+async function initDuckDB() {
+  if (location.protocol === 'file:') throw new Error('This page was opened as a file, and browsers block the analysis engine on file://. Close this tab and double-click “Open in browser.cmd” in the same folder instead (it needs nothing installed), or use the desktop app.');
+  const duckdb = await import('./lib/duckdb/duckdb-browser.mjs');
+  const base = new URL('./lib/duckdb/', location.href).href;     // absolute: the worker resolves URLs from its own location
+  const bundle = await duckdb.selectBundle({
+    mvp: { mainModule: base + 'duckdb-mvp.wasm', mainWorker: base + 'duckdb-browser-mvp.worker.js' },
+    eh: { mainModule: base + 'duckdb-eh.wasm', mainWorker: base + 'duckdb-browser-eh.worker.js' }
+  });
+  const worker = new Worker(bundle.mainWorker);
+  const logger = duckdb.VoidLogger ? new duckdb.VoidLogger() : new duckdb.ConsoleLogger();
+  S.duck = duckdb;                                                // also carries the Arrow builders
+  S.db = new duckdb.AsyncDuckDB(logger, worker);
+  await S.db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+  S.conn = await S.db.connect();
+  S.platform = /-eh\.wasm$/.test(bundle.mainModule) ? 'wasm_eh' : 'wasm_mvp';
+  if (CONFIG.extensionRepo) {
+    // Every extension load, including automatic ones, resolves against the local folder.
+    await S.conn.query(`SET custom_extension_repository=${qstr(CONFIG.extensionRepo)}`);
+    await S.conn.query(`SET autoinstall_extension_repository=${qstr(CONFIG.extensionRepo)}`);
+  }
+}
+
+async function ensureSpatial() {
+  if (S.spatial !== undefined) return S.spatial;
+  try {
+    await S.conn.query('LOAD spatial');
+    S.spatial = true;
+  } catch (e) {
+    console.warn('LOAD spatial failed', e);
+    let where = 'extensions.duckdb.org (needs internet)';
+    if (CONFIG.extensionRepo) {
+      const v = (await q('SELECT version() AS v'))[0].v;
+      where = `${CONFIG.extensionRepo}/${v}/${S.platform}/spatial.duckdb_extension.wasm`;
+    }
+    S.spatial = false;
+    S.spatialError = `DuckDB’s spatial extension could not be loaded from ${where}. It is needed for .gpkg and .shp; run “node get-libs.mjs” again, or convert the layer to GeoJSON in QGIS and drop that file.`;
+  }
+  return S.spatial;
+}
+
+/* attribute table used by every widget: one row per feature, plus bbox columns.
+   Built as an Arrow table in JS, so DuckDB needs no json extension (and no download).
+   Date fields arrive as text and are converted to TIMESTAMP (time zone offsets dropped). */
+async function createTable(ds) {
+  const { Table, vectorFromArray, Float64, Int32, Utf8 } = S.duck;
+  const F = ds.fc.features, n = F.length;
+  const col = (name, type, get) => { const a = new Array(n); for (let i = 0; i < n; i++) a[i] = get(F[i].properties, i); return [name, vectorFromArray(a, type)]; };
+  const bb = k => (_, i) => ds.bbox[4 * i + k];
+  const cols = [
+    col('fid', new Int32(), p => p.fid),
+    ...ds.cols.map(c => c.kind === 'num' ? col(c.name, new Float64(), p => p[c.name]) : col(c.name, new Utf8(), p => p[c.name])),
+    col('_area_km2', new Float64(), p => p._area_km2), col('_len_km', new Float64(), p => p._len_km),
+    col('_minx', new Float64(), bb(0)), col('_miny', new Float64(), bb(1)), col('_maxx', new Float64(), bb(2)), col('_maxy', new Float64(), bb(3))
+  ];
+  await q('DROP TABLE IF EXISTS f');
+  await enqueue(() => S.conn.insertArrowTable(new Table(Object.fromEntries(cols)), { name: 'f', create: true }));
+  for (const c of ds.cols.filter(c => c.kind === 'date'))
+    await q(`ALTER TABLE f ALTER ${qid(c.name)} SET DATA TYPE TIMESTAMP USING TRY_CAST(regexp_replace(${qid(c.name)}, '(Z|[+-][0-9]{2}:?[0-9]{2})$', '') AS TIMESTAMP)`);
+}
+
+/* ================================================================
+   6. LOADING FILES
+   ================================================================ */
+async function dropSourceFiles() {
+  for (const n of S.files) { try { await S.db.dropFile(n); } catch (e) { /* already gone */ } }
+  S.files = [];
+}
+/* register files in DuckDB's virtual file system; items are File objects or { name, data } */
+async function put(dir, items) {
+  const paths = [];
+  for (const f of items) {
+    const n = `${dir}/${f.name.split('/').pop()}`;
+    await S.db.registerFileBuffer(n, f.data || new Uint8Array(await f.arrayBuffer()));   // for very large files see registerFileHandle
+    S.files.push(n); paths.push(n);
+  }
+  return paths;
+}
+
+/* layers with geometry, and each one's CRS as "EPSG:xxxx" when the file says so */
+async function listLayers(path) {
+  try {
+    const r = await q(`SELECT l.name AS name, len(l.geometry_fields) AS ng, l.geometry_fields[1].crs.auth_name AS an, l.geometry_fields[1].crs.auth_code AS ac
+                       FROM (SELECT unnest(layers) AS l FROM ST_Read_Meta(${qstr(path)}))`);
+    return r.filter(l => l.ng > 0).map(l => ({ name: l.name, crs: l.an && l.ac ? `${l.an}:${l.ac}` : null }));
+  } catch (e) { console.warn('ST_Read_Meta failed; loading the first layer', e); return []; }
+}
+
+/* ST_Read (GDAL inside DuckDB) -> GeoJSON features in EPSG:4326.
+   Attributes come back as plain Arrow columns: numbers as DOUBLE, everything else
+   (dates, booleans, ...) as text, so no json extension is involved. */
+const NUMERIC_TYPE = /^(U?(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT)|FLOAT|REAL|DOUBLE|DECIMAL)/i;
+async function readLayer(path, layer, crs) {
+  const arg = layer ? `, layer=${qstr(layer)}` : '';
+  await q(`CREATE OR REPLACE TEMP TABLE _src AS SELECT row_number() OVER () - 1 AS __fid, * FROM ST_Read(${qstr(path)}${arg})`);
+  const info = await q(`SELECT name, type FROM pragma_table_info('_src')`);
+  const geo = (info.find(c => /^GEOMETRY/i.test(c.type)) || info.find(c => c.name === 'geom') || {}).name || 'geom';
+  const attrs = info.filter(c => c.name !== geo && c.name !== '__fid' && !/BLOB|GEOMETRY/i.test(c.type));
+  const cols = attrs.map((c, i) => (NUMERIC_TYPE.test(c.type) ? `CAST(${qid(c.name)} AS DOUBLE)` : /^VARCHAR/i.test(c.type) ? qid(c.name) : `CAST(${qid(c.name)} AS VARCHAR)`) + ` AS c${i}`);
+  const sqlFor = g => `SELECT CAST(ST_AsGeoJSON(${g}) AS VARCHAR) AS __g${cols.map(c => ', ' + c).join('')} FROM _src ORDER BY __fid`;
+  let t;
+  const reproject = crs && crs !== 'EPSG:4326';
+  try {
+    t = await qTable(sqlFor(reproject ? `ST_Transform(${qid(geo)}, ${qstr(crs)}, 'EPSG:4326', always_xy := true)` : qid(geo)));
+  } catch (e) {
+    if (!reproject) throw e;
+    console.warn('ST_Transform failed; reading coordinates as they are', e);
+    t = await qTable(sqlFor(qid(geo)));   // buildDataset will explain if these turn out to be projected
+  }
+  await q('DROP TABLE IF EXISTS _src');
+  const G = t.getChildAt(0), A = attrs.map((_, i) => t.getChildAt(i + 1)), feats = [];
+  for (let r = 0; r < t.numRows; r++) {
+    const g = G.get(r);
+    if (!g) continue;
+    const props = {};
+    attrs.forEach((c, i) => { props[c.name] = A[i].get(r); });
+    feats.push({ type: 'Feature', geometry: JSON.parse(g), properties: props });
+  }
+  return feats;
+}
+
+/* ---- File geodatabase: DuckDB-WASM's GDAL has no OpenFileGDB driver, so .gdb goes
+   through GDAL-WASM (gdal3.js, ~40 MB in lib/gdal), loaded only the first time it is needed. */
+function loadGdal() {
+  if (!S.gdalPromise) S.gdalPromise = (async () => {
+    if (!window.initGdalJs) await new Promise((res, rej) => {
+      const s = el('script'); s.src = 'lib/gdal/gdal3.js';
+      s.onload = res; s.onerror = () => rej(new Error('lib/gdal/gdal3.js is missing, so file geodatabases cannot be read. Run “node get-libs.mjs” again, or convert the layer to GeoPackage in QGIS or ArcGIS.'));
+      document.head.append(s);
+    });
+    return window.initGdalJs({ path: new URL('./lib/gdal', location.href).href, useWorker: true });
+  })();
+  S.gdalPromise.catch(() => { S.gdalPromise = null; });
+  return S.gdalPromise;
+}
+
+async function openGdb(zipFile) {
+  notify('Loading the geodatabase reader (first time only)…', 'info', 0);
+  const Gdal = await loadGdal();
+  notify('Reading geodatabase…', 'info', 0);
+  const r = await Gdal.open(zipFile, [], ['vsizip']);
+  if (!r.datasets.length) throw new Error(`GDAL could not open ${zipFile.name}. Make sure the zip holds the whole Name.gdb folder.`);
+  const ds = r.datasets[0], info = await Gdal.getInfo(ds);
+  return { kind: 'gdal', Gdal, ds, label: zipFile.name, layers: (info.layers || []).filter(l => l.featureCount > 0).map(l => ({ name: l.name, crs: null })) };
+}
+
+/* ogr2ogr to GeoJSON in EPSG:4326; GDAL reprojects from whatever the layer uses */
+async function readGdalLayer(src, layer) {
+  const out = await src.Gdal.ogr2ogr(src.ds, ['-f', 'GeoJSON', '-t_srs', 'EPSG:4326', '-lco', 'RFC7946=YES', ...(layer ? [layer] : [])]);
+  const bytes = await src.Gdal.getFileBytes(out);
+  return featuresFromGeoJSON(JSON.parse(new TextDecoder().decode(bytes)));
+}
+
+async function loadLayer(name) {
+  const info = S.layers.find(l => l.name === name);
+  notify('Reading layer…', 'info', 0);
+  const feats = S.src.kind === 'gdal' ? await readGdalLayer(S.src, name) : await readLayer(S.src.path, name, info && info.crs);
+  await ingest(feats, S.src.label + (name && S.layers.length > 1 ? ' / ' + name : ''));
+}
+
+async function handleFiles(list, folders = []) {
+  let files = [...list];
+  try {
+    if (folders.length) {
+      throw new Error(`“${folders[0]}” is a folder. Zip it (a file geodatabase must be zipped as Name.gdb.zip) and drop the zip file instead.`);
+    }
+    if (!files.length) return;
+    await S.dbPromise;
+    const low = n => n.toLowerCase();
+    let srcLabel = files[0].name;
+
+    // A zip is either a file geodatabase (-> GDAL-WASM) or holds ordinary files (-> unzip here).
+    const zip = files.find(f => /\.zip$/i.test(f.name));
+    if (zip) {
+      srcLabel = zip.name;
+      const entries = await unzip(await zip.arrayBuffer());
+      if (/\.gdb\.zip$/i.test(zip.name) || entries.some(e => /\.gdb\//i.test(e.name) || /\.gdbtable$/i.test(e.name))) {
+        const src = await openGdb(zip);
+        return await useSource(src);
+      }
+      files = entries.map(e => ({ name: e.name.split('/').pop(), data: e.data, text: async () => new TextDecoder().decode(e.data) }));
+    }
+
+    const gj = files.find(f => /\.(geo)?json$/i.test(f.name));
+    if (gj) {
+      notify(`Reading ${gj.name}…`, 'info', 0);
+      $('layerSel').hidden = true;
+      return await ingest(featuresFromGeoJSON(JSON.parse(await gj.text())), zip ? srcLabel : gj.name);
+    }
+    const shp = files.find(f => /\.shp$/i.test(f.name)), gpkg = files.find(f => /\.gpkg$/i.test(f.name));
+    if (!shp && !gpkg) throw new Error(zip ? `${zip.name} holds no .shp, .gpkg, .geojson or .gdb folder.` : 'Nothing to read here. Use a .gpkg, a .shp with its .dbf and .shx, a zipped .gdb or shapefile, or a .geojson file.');
+    if (!gpkg) {
+      const missing = ['dbf', 'shx'].filter(x => !files.some(f => low(f.name) === low(shp.name).replace(/\.shp$/, '.' + x)));
+      if (missing.length) throw new Error(`Select the .${missing.join(' and .')} file together with the .shp (and the .prj so the projection is known).`);
+    }
+    notify('Loading DuckDB’s spatial extension…', 'info', 0);
+    if (!(await ensureSpatial())) throw new Error(S.spatialError);
+    await dropSourceFiles();
+    const dir = 'src' + (++S.fileSeq);
+    notify('Reading files…', 'info', 0);
+    let path;
+    if (gpkg) { [path] = await put(dir, [gpkg]); if (!zip) srcLabel = gpkg.name; }
+    else {
+      const base = low(shp.name).replace(/\.shp$/, '.');
+      const group = files.filter(f => low(f.name).startsWith(base));
+      path = (await put(dir, group))[group.indexOf(shp)];
+      if (!zip) srcLabel = shp.name;
+    }
+    await useSource({ kind: 'duckdb', path, label: srcLabel, layers: await listLayers(path) });
+  } catch (e) { fail(e); }
+}
+
+/* remember the source, offer its layers in the header picker, load the first one */
+async function useSource(src) {
+  if (S.src && S.src.kind === 'gdal' && S.src.ds !== src.ds) { try { await S.src.Gdal.close(S.src.ds); } catch (e) { /* ignore */ } }
+  S.src = src; S.layers = src.layers;
+  const sel = $('layerSel');
+  sel.replaceChildren();
+  for (const l of S.layers) { const o = el('option', null, l.name); o.value = l.name; sel.append(o); }
+  sel.hidden = S.layers.length < 2;
+  await loadLayer(S.layers.length ? S.layers[0].name : undefined);
+}
+
+/* ================================================================
+   7. INGEST: new dataset -> table, map source, dashboard
+   ================================================================ */
+async function ingest(features, srcLabel) {
+  await S.dbPromise; await S.mapLoaded;
+  notify('Building tables…', 'info', 0);
+  const ds = buildDataset(features);
+  await createTable(ds);
+  S.ds = ds; S.fc = ds.fc; S.bbox = ds.bbox; S.n = ds.fc.features.length;
+  S.filters = new Map(); S.sel = new Map(); S.range = new Map(); S.detail = new Map(); S.hl = null; S.pick = null; S.hover = null;
+  S.cache = new Map(); S.colors = new Map(); S.data = new Map(); S.mapFiltered = false; S.maxId = null;
+  closePopup(); setBoxMode(false); drawBox(); updateHighlight();
+  S.map.getSource('data').setData(S.fc);
+  S.sig = signature(ds);
+  S.dash = chooseDashboard(ds);
+  for (const id of ['editBtn', 'saveLayoutBtn', 'loadLayoutBtn', 'resetLayoutBtn', 'exportBtn', 'csvBtn', 'pngBtn', 'printBtn']) $(id).disabled = false;
+  $('empty').hidden = true;
+  $('searchBox').hidden = false;
+  $('searchIn').value = ''; $('results').hidden = true;
+  $('srcName').textContent = srcLabel;
+  setWindowTitle();
+  renderLayout();
+  await applyColors();
+  fitTo(ds.extent);
+  const b = S.map.getBounds();
+  S.extent = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
+  await refresh();
+  $('msg').hidden = true;
+}
+
+/* ================================================================
+   8. DASHBOARD LAYOUT: config, persistence, widget shells
+   ================================================================ */
+const COMMON = { followFilters: true, followExtent: false };
+const CLICK_CHART = [['filter', 'Filter the map and other widgets'], ['zoom', 'Zoom the map to those features'], ['highlight', 'Highlight those features on the map'], ['none', 'Nothing']];
+const STATS = [['count', 'Number of features'], ['sum', 'Sum of a field'], ['avg', 'Average of a field'], ['min', 'Minimum of a field'], ['max', 'Maximum of a field']];
+
+/* Widget types: defaults, settings form (k = config key) and the click actions they offer */
+const TYPES = {
+  indicator: {
+    name: 'Indicator', about: 'One headline figure: a count, sum, average, minimum or maximum.', size: [3, 2],
+    defaults: { stat: 'count', field: null, suffix: '', reference: 'none', onClick: 'zoom' },
+    controls: [
+      { k: 'stat', label: 'Statistic', type: 'select', options: STATS },
+      { k: 'field', label: 'Field', type: 'field', kinds: ['num'], when: c => c.stat !== 'count' },
+      { k: 'suffix', label: 'Unit after the number (optional)', type: 'text' },
+      { k: 'reference', label: 'Compare with', type: 'select', options: [['none', 'Nothing'], ['all', 'All features (the value without filters)']] }
+    ],
+    clicks: [['zoom', 'Zoom the map to the features counted'], ['locate', 'Locate the feature (for minimum / maximum)'], ['none', 'Nothing']]
+  },
+  category: {
+    name: 'Category chart', about: 'Features grouped by a text field, as bars, columns, a donut or a pie.', size: [4, 4],
+    defaults: { field: null, chart: 'bar', stat: 'count', valueField: null, max: 12, colors: 'single', onClick: 'filter' },
+    controls: [
+      { k: 'field', label: 'Group by', type: 'field', kinds: ['str'] },
+      { k: 'chart', label: 'Chart type', type: 'select', options: [['bar', 'Bars'], ['column', 'Columns'], ['donut', 'Donut'], ['pie', 'Pie']] },
+      { k: 'stat', label: 'Value', type: 'select', options: STATS.slice(0, 3) },
+      { k: 'valueField', label: 'Value field', type: 'field', kinds: ['num'], when: c => c.stat !== 'count' },
+      { k: 'max', label: 'Groups shown', type: 'number', min: 2, max: 50 },
+      { k: 'colors', label: 'Colours', type: 'select', options: [['single', 'One colour'], ['category', 'One colour per group (as on the map)']], when: c => c.chart === 'bar' || c.chart === 'column' }
+    ],
+    clicks: CLICK_CHART
+  },
+  histogram: {
+    name: 'Histogram', about: 'How a number field is distributed, in equal-width bins.', size: [4, 3],
+    defaults: { field: null, bins: 12, onClick: 'filter' },
+    controls: [
+      { k: 'field', label: 'Field', type: 'field', kinds: ['num'] },
+      { k: 'bins', label: 'Bins', type: 'number', min: 3, max: 60 }
+    ],
+    clicks: CLICK_CHART
+  },
+  time: {
+    name: 'Time chart', about: 'Features over time, or by hour of day, day of week or month of year.', size: [6, 3],
+    defaults: { field: null, mode: 'timeline', interval: 'auto', chart: 'column', stat: 'count', valueField: null, onClick: 'filter' },
+    controls: [
+      { k: 'field', label: 'Date field', type: 'field', kinds: ['date'] },
+      { k: 'mode', label: 'Show', type: 'select', options: [['timeline', 'Over time'], ['hour', 'By hour of day'], ['dow', 'By day of week'], ['month', 'By month of year']] },
+      { k: 'interval', label: 'Interval', type: 'select', options: [['auto', 'Automatic'], ['year', 'Year'], ['month', 'Month'], ['week', 'Week'], ['day', 'Day'], ['hour', 'Hour']], when: c => c.mode === 'timeline' },
+      { k: 'chart', label: 'Chart type', type: 'select', options: [['column', 'Columns'], ['line', 'Line']] },
+      { k: 'stat', label: 'Value', type: 'select', options: STATS.slice(0, 3) },
+      { k: 'valueField', label: 'Value field', type: 'field', kinds: ['num'], when: c => c.stat !== 'count' }
+    ],
+    clicks: CLICK_CHART
+  },
+  gauge: {
+    name: 'Gauge', about: 'The share of features that have one value, as a ring.', size: [3, 2],
+    defaults: { field: null, value: null, onClick: 'filter' },
+    controls: [
+      { k: 'field', label: 'Field', type: 'field', kinds: ['str'] },
+      { k: 'value', label: 'Value', type: 'value', of: 'field' }
+    ],
+    clicks: CLICK_CHART
+  },
+  list: {
+    name: 'Feature list', about: 'A sorted list of features; click one to find it on the map.', size: [3, 6],
+    defaults: { titleField: 'fid', subField: null, sortField: 'fid', order: 'desc', limit: 100, hover: true, onClick: 'locate' },
+    controls: [
+      { k: 'titleField', label: 'Title', type: 'field', kinds: ['str', 'num', 'date', 'fid'] },
+      { k: 'subField', label: 'Second line (optional)', type: 'field', kinds: ['str', 'num', 'date', 'fid'], optional: true },
+      { k: 'sortField', label: 'Sort by', type: 'field', kinds: ['num', 'date', 'str', 'fid'] },
+      { k: 'order', label: 'Order', type: 'select', options: [['desc', 'Highest / latest first'], ['asc', 'Lowest / earliest first']] },
+      { k: 'limit', label: 'Rows shown', type: 'number', min: 5, max: 1000 },
+      { k: 'hover', label: 'Highlight the feature on the map while pointing at a row', type: 'check' }
+    ],
+    clicks: [['locate', 'Zoom to the feature and open its popup'], ['filter', 'Filter the map and other widgets to it'], ['none', 'Nothing']]
+  },
+  table: {
+    name: 'Table', about: 'The attribute table: sortable columns, click a row to find it, export to CSV.', size: [12, 5],
+    defaults: { columns: null, sortField: 'fid', order: 'asc', limit: 500, hover: true, onClick: 'locate' },
+    controls: [
+      { k: 'columns', label: 'Columns (none ticked = the first eight fields)', type: 'fields', kinds: ['str', 'num', 'date', 'fid'] },
+      { k: 'sortField', label: 'Sort by', type: 'field', kinds: ['num', 'date', 'str', 'fid'] },
+      { k: 'order', label: 'Order', type: 'select', options: [['asc', 'Lowest / earliest / A first'], ['desc', 'Highest / latest / Z first']] },
+      { k: 'limit', label: 'Rows shown (CSV export has them all)', type: 'number', min: 10, max: 5000 },
+      { k: 'hover', label: 'Highlight the feature on the map while pointing at a row', type: 'check' }
+    ],
+    clicks: [['locate', 'Zoom to the feature and open its popup'], ['filter', 'Filter the map and other widgets to it'], ['none', 'Nothing']]
+  },
+  details: {
+    name: 'Details', about: 'Every attribute of one feature: the one picked on the map, or step through the filtered features.', size: [3, 6],
+    defaults: { titleField: null, fields: null },
+    controls: [
+      { k: 'titleField', label: 'Heading (optional)', type: 'field', kinds: ['str', 'num', 'date', 'fid'], optional: true },
+      { k: 'fields', label: 'Fields shown (none ticked = all)', type: 'fields', kinds: ['str', 'num', 'date'] }
+    ],
+    clicks: null, follow: true
+  },
+  selector: {
+    name: 'Selector', about: 'Filter everything by choosing values from a list or buttons, a number range or a date range.', size: [3, 2],
+    defaults: { field: null, style: 'dropdown' },
+    controls: [
+      { k: 'field', label: 'Field', type: 'field', kinds: ['str', 'num', 'date'] },
+      { k: 'style', label: 'Show values as', type: 'select', options: [['dropdown', 'A dropdown list (one value)'], ['buttons', 'Buttons (several values)']], when: c => kindOf(c.field) === 'str' }
+    ],
+    clicks: null, follow: true
+  },
+  text: {
+    name: 'Text', about: 'A heading, a note or instructions.', size: [3, 2],
+    defaults: { text: 'Describe this dashboard here.' },
+    controls: [{ k: 'text', label: 'Text', type: 'textarea' }],
+    clicks: null
+  },
+  map: {
+    name: 'Map', about: '', size: [8, 7], single: true,
+    defaults: { shade: 'category', shadeField: null, legend: true, frame: false, onClick: 'popup' },
+    controls: [
+      { k: 'shade', label: 'Colour features by', type: 'select', options: [['category', 'A text field (one colour per value)'], ['measure', 'A number field (light to dark)'], ['none', 'One colour']] },
+      { k: 'shadeField', label: 'Colour field', type: 'field', kinds: c => c.shade === 'measure' ? ['num'] : ['str'], when: c => c.shade !== 'none' },
+      { k: 'legend', label: 'Show the legend', type: 'check' },
+      { k: 'frame', label: 'Coordinate frame around the map (like a printed sheet)', type: 'check' }
+    ],
+    clicks: [['popup', 'Open the feature’s popup'], ['filter', 'Filter the other widgets to that feature'], ['none', 'Nothing']]
+  }
+};
+
+const TYPE_ICON = { indicator: 'hash', category: 'bars', histogram: 'hist', time: 'time', gauge: 'gauge', list: 'list', table: 'table', details: 'info', selector: 'sliders', text: 'text', map: 'map' };
+const mapCfg = () => (S.dash && S.dash.widgets.find(w => w.type === 'map')) || { ...TYPES.map.defaults };
+const fieldList = () => S.ds ? [...S.ds.cols.map(c => c.name), ...S.ds.numFields.filter(n => DERIVED[n]), 'fid'] : [];
+const hasField = n => n === 'fid' || !!(S.ds && (S.ds.cols.some(c => c.name === n) || S.ds.numFields.includes(n)));
+const kindOf = n => n === 'fid' ? 'fid' : DERIVED[n] ? 'num' : ((S.ds.cols.find(c => c.name === n) || {}).kind);
+const FIELD_KEYS = ['field', 'valueField', 'titleField', 'subField', 'sortField', 'shadeField'];
+
+/* the fields a widget needs that this layer does not have */
+function missingFields(wg) {
+  const t = TYPES[wg.type];
+  return (t.controls || []).filter(c => c.type === 'field' && !(c.when && !c.when(wg)) && !c.optional)
+    .map(c => wg[c.k]).filter(v => !v || !hasField(v));
+}
+
+function titleFor(wg) {
+  const L = label;
+  switch (wg.type) {
+    case 'indicator': return wg.stat === 'count' ? 'Features' : `${STAT_NAME[wg.stat]} ${L(wg.field)}`;
+    case 'category': return wg.stat === 'count' ? `Features by ${L(wg.field)}` : `${STAT_NAME[wg.stat]} ${L(wg.valueField)} by ${L(wg.field)}`;
+    case 'histogram': return `Distribution of ${L(wg.field)}`;
+    case 'time': return ({ timeline: 'Features over time', hour: 'Features by hour of day', dow: 'Features by day of week', month: 'Features by month' })[wg.mode] + (wg.stat !== 'count' ? ` (${STAT_NAME[wg.stat].toLowerCase()} ${L(wg.valueField)})` : '');
+    case 'gauge': return `${L(wg.field)}: ${wg.value ?? ''}`;
+    case 'list': return `Features by ${L(wg.sortField)}`;
+    case 'table': return 'Attribute table';
+    case 'details': return 'Feature details';
+    case 'selector': return `Filter by ${L(wg.field)}`;
+    case 'map': return 'Map';
+    default: return '';
+  }
+}
+
+/* fill defaults, keep one map, drop unknown types */
+function normalize(dash) {
+  const d = { version: 1, title: dash.title || 'Layer dashboard', widgets: [] };
+  let maps = 0;
+  for (const w of dash.widgets || []) {
+    const t = TYPES[w.type];
+    if (!t || (t.single && maps++)) continue;
+    const wg = { ...COMMON, ...t.defaults, ...w };
+    wg.id = String(wg.id || 'w' + Math.random().toString(36).slice(2, 8));
+    if (wg.type === 'map') { wg.id = 'map'; delete wg.followExtent; }
+    wg.w = Math.min(12, Math.max(1, Math.round(wg.w || t.size[0])));
+    wg.h = Math.min(14, Math.max(1, Math.round(wg.h || t.size[1])));
+    if (wg.titleAuto !== false) { wg.titleAuto = true; wg.title = titleFor(wg); }
+    d.widgets.push(wg);
+  }
+  if (!maps) d.widgets.push({ ...COMMON, ...TYPES.map.defaults, id: 'map', type: 'map', w: 8, h: 7, titleAuto: true, title: 'Map' });
+  return d;
+}
+
+/* layouts are remembered per dataset "shape": the same field names and kinds */
+function signature(ds) {
+  const s = ds.cols.map(c => c.name + ':' + c.kind).sort().join('|');
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return 'dash:' + h.toString(36);
+}
+function storedDash() { try { const j = localStorage.getItem(S.sig); return j ? JSON.parse(j) : null; } catch (e) { return null; } }
+function saveDash() { try { localStorage.setItem(S.sig, JSON.stringify(S.dash)); } catch (e) { /* storage blocked: layout lasts for this visit */ } }
+
+/* your own saved layout, else the shared dashboard.json if its fields exist here, else automatic */
+function chooseDashboard(ds) {
+  const own = storedDash();
+  if (own) return normalize(own);
+  if (S.shared) {
+    const d = normalize(S.shared);
+    if (d.widgets.every(w => !missingFields(w).length)) return d;
+  }
+  return normalize(autoDashboard(ds));
+}
+
+function renderLayout() {
+  const grid = $('grid');
+  grid.classList.toggle('solo', !S.fc);
+  hideTip();
+  S.bodies = new Map();
+  $('mapHolder').append($('mapwrap'));             // park the map while shells are rebuilt
+  grid.replaceChildren();
+  $('dashTitle').textContent = S.dash ? S.dash.title : 'Layer dashboard';
+  const widgets = S.dash ? S.dash.widgets : [{ id: 'map', type: 'map', w: 12, h: 9, title: 'Map' }];
+  if (S.maxId && !widgets.some(w => w.id === S.maxId)) S.maxId = null;
+  grid.classList.toggle('maxed', !!S.maxId);
+  for (const wg of widgets) grid.append(shell(wg));
+  $('mapwrap').classList.toggle('framed', !!(S.dash && mapCfg().frame));
+  const mx = S.maxId === 'map';
+  $('mapMaxBtn').replaceChildren(icon(mx ? 'min' : 'max'));
+  $('mapMaxBtn').title = mx ? 'Restore the dashboard (Esc)' : 'Maximize the map';
+}
+
+/* show one widget over the whole dashboard, or go back */
+function toggleMax(id) {
+  S.maxId = S.maxId === id ? null : id;
+  renderLayout();
+  const wg = S.dash && S.dash.widgets.find(w => w.id === id);
+  if (wg) renderWidget(wg);
+  if (S.map) requestAnimationFrame(() => { S.map.resize(); updateFrame(); });
+}
+
+function shell(wg) {
+  const s = el('section', 'wg t-' + wg.type + (S.maxId === wg.id ? ' max' : ''));   // prefixed: type names must not collide with chart classes
+  s.dataset.id = wg.id;
+  s.style.setProperty('--w', wg.w); s.style.setProperty('--h', wg.h);
+  const hd = el('header');
+  const h2 = el('h2', null, wg.title || (wg.type === 'map' ? 'Map' : ''));
+  const tools = el('span', 'tools');
+  const name = wg.title || TYPES[wg.type].name;
+  if (S.fc && wg.type !== 'map') {
+    const mx = el('button'); mx.type = 'button'; mx.append(icon(S.maxId === wg.id ? 'min' : 'max'));
+    mx.title = S.maxId === wg.id ? 'Restore (Esc)' : 'Maximize'; mx.setAttribute('aria-label', mx.title + ': ' + name);
+    mx.onclick = () => toggleMax(wg.id);
+    tools.append(mx);
+  }
+  const gear = el('button', 'cfg'); gear.type = 'button'; gear.append(icon('gear'));
+  gear.title = 'Settings and map interaction'; gear.setAttribute('aria-label', 'Settings for ' + name);
+  gear.onclick = () => openSettings(wg.id);
+  tools.append(gear);
+  hd.append(h2, tools);
+  const body = el('div', 'body');
+  if (wg.type === 'map') body.append($('mapwrap'));
+  const rz = el('div', 'resize'); rz.title = 'Drag to resize';
+  s.append(hd, body, rz);
+  S.bodies.set(wg.id, body);
+  if (S.fc && S.dash) { wireDrag(s, hd, wg); wireResize(s, rz, wg); }
+  if (S.data.has(wg.id) || wg.type === 'text') renderWidget(wg);
+  return s;
+}
+
+/* ---- edit mode: drag to reorder, drag the corner to resize ---- */
+function setEditing(on) {
+  S.editing = on;
+  document.body.classList.toggle('editing', on);
+  $('editBtn').setAttribute('aria-pressed', String(on));
+  $('editBar').hidden = !on;
+  $('dashTitle').contentEditable = on ? 'true' : 'false';
+  for (const s of document.querySelectorAll('.wg > header')) s.draggable = on;
+}
+
+function wireDrag(s, hd, wg) {
+  hd.draggable = S.editing;
+  hd.addEventListener('dragstart', e => { if (!S.editing) return e.preventDefault(); S.dragId = wg.id; s.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', wg.id); });
+  hd.addEventListener('dragend', () => { s.classList.remove('dragging'); S.dragId = null; for (const n of document.querySelectorAll('.dropBefore,.dropAfter')) n.classList.remove('dropBefore', 'dropAfter'); });
+  const after = e => { const r = s.getBoundingClientRect(); return e.clientX > r.left + r.width / 2; };
+  s.addEventListener('dragover', e => {
+    if (!S.dragId || S.dragId === wg.id) return;
+    e.preventDefault();
+    s.classList.toggle('dropAfter', after(e)); s.classList.toggle('dropBefore', !after(e));
+  });
+  s.addEventListener('dragleave', () => s.classList.remove('dropBefore', 'dropAfter'));
+  s.addEventListener('drop', e => {
+    e.preventDefault();
+    const from = S.dragId;
+    s.classList.remove('dropBefore', 'dropAfter');
+    if (!from || from === wg.id) return;
+    const W = S.dash.widgets, moved = W.splice(W.findIndex(w => w.id === from), 1)[0];
+    W.splice(W.findIndex(w => w.id === wg.id) + (after(e) ? 1 : 0), 0, moved);
+    saveDash(); renderLayout();
+  });
+}
+
+function wireResize(s, rz, wg) {
+  rz.addEventListener('pointerdown', e => {
+    if (!S.editing) return;
+    e.preventDefault(); rz.setPointerCapture(e.pointerId);
+    const grid = $('grid'), cs = getComputedStyle(grid), gap = parseFloat(cs.columnGap) || 8;
+    const colW = (grid.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - 11 * gap) / 12;
+    const r0 = s.getBoundingClientRect(), x0 = e.clientX, y0 = e.clientY;
+    const rowH = (r0.height + gap) / wg.h - gap;          // rows stretch, so measure the real height
+    const move = ev => {
+      wg.w = Math.min(12, Math.max(1, Math.round((r0.width + ev.clientX - x0 + gap) / (colW + gap))));
+      wg.h = Math.min(14, Math.max(1, Math.round((r0.height + ev.clientY - y0 + gap) / (rowH + gap))));
+      s.style.setProperty('--w', wg.w); s.style.setProperty('--h', wg.h);
+    };
+    const up = () => { rz.removeEventListener('pointermove', move); rz.removeEventListener('pointerup', up); saveDash(); renderWidget(wg); };
+    rz.addEventListener('pointermove', move); rz.addEventListener('pointerup', up);
+  });
+}
+
+/* ---- settings dialog, generated from the widget type's controls ---- */
+function openSettings(id) {
+  const dlg = $('cfgDlg');
+  buildSettings(id);
+  if (!dlg.open) dlg.showModal();
+}
+
+function fieldOptions(kinds) {
+  const out = [];
+  for (const n of fieldList()) {
+    const k = kindOf(n);
+    if (kinds.includes(k)) out.push([n, label(n) + (k === 'date' ? ' (date)' : '')]);
+  }
+  return out;
+}
+
+function buildSettings(id) {
+  const wg = S.dash.widgets.find(w => w.id === id), t = TYPES[wg.type], form = $('cfgForm');
+  form.replaceChildren();
+  form.append(el('h2', null, `${t.name} settings`));
+  const sc = el('div', 'scroll');
+  const input = (c, fs) => {
+    if (c.when && !c.when(wg)) return;
+    if (c.type === 'fields') {                     // several fields: a box of tick boxes, in field order
+      const lab = el('label'), box = el('div', 'checks'), cur = new Set(wg[c.k] || []);
+      for (const [v, text] of fieldOptions(c.kinds)) {
+        const row = el('label', 'chk'), cb = el('input');
+        cb.type = 'checkbox'; cb.checked = cur.has(v);
+        cb.onchange = () => {
+          const on = [...box.querySelectorAll('input')].map((x, i) => x.checked ? fieldOptions(c.kinds)[i][0] : null).filter(Boolean);
+          changeWidget(wg, c.k, on.length ? on : null, c);
+        };
+        row.append(cb, text); box.append(row);
+      }
+      lab.append(c.label, box); fs.append(lab);
+      return;
+    }
+    const lab = el('label', c.type === 'check' ? 'chk' : null);
+    let ctl;
+    if (c.type === 'select' || c.type === 'field' || c.type === 'value') {
+      ctl = el('select', 'sel');
+      let opts = c.options;
+      if (c.type === 'field') {
+        opts = fieldOptions(typeof c.kinds === 'function' ? c.kinds(wg) : c.kinds);
+        if (c.optional) opts = [['', '(none)'], ...opts];
+        if (!opts.length) opts = [['', 'No suitable field in this layer']];
+      }
+      if (c.type === 'value') {
+        const col = S.ds.cols.find(x => x.name === wg[c.of]);
+        opts = (col ? col.values : []).map(v => [v, v]);
+        if (!opts.length) opts = [['', 'Choose a field first']];
+      }
+      for (const [v, text] of opts) { const o = el('option', null, text); o.value = v; ctl.append(o); }
+      ctl.value = wg[c.k] == null ? '' : String(wg[c.k]);
+      if (ctl.value === '' && wg[c.k] != null && ctl.options.length) ctl.selectedIndex = 0;
+    } else if (c.type === 'check') {
+      ctl = el('input'); ctl.type = 'checkbox'; ctl.checked = wg[c.k] !== false;
+    } else if (c.type === 'textarea') {
+      ctl = el('textarea'); ctl.value = wg[c.k] || '';
+    } else {
+      ctl = el('input'); ctl.type = c.type === 'number' ? 'number' : 'text';
+      if (c.min != null) { ctl.min = c.min; ctl.max = c.max; }
+      ctl.value = wg[c.k] ?? '';
+    }
+    const apply = () => {
+      let v = c.type === 'check' ? ctl.checked : ctl.value;
+      if (c.type === 'number') v = Math.min(c.max, Math.max(c.min, Math.round(Number(v) || c.min)));
+      if (v === '' && c.type !== 'text' && c.type !== 'textarea') v = null;
+      changeWidget(wg, c.k, v, c);
+    };
+    const live = c.type === 'text' || c.type === 'textarea';
+    ctl.addEventListener(live ? 'input' : 'change', apply);
+    if (c.type === 'check') lab.append(ctl, c.label); else lab.append(c.label, ctl);
+    fs.append(lab);
+  };
+
+  const fs1 = el('fieldset'); fs1.append(el('legend', null, 'Content'));
+  if (wg.type !== 'map') input({ k: 'title', label: 'Title', type: 'text' }, fs1);
+  for (const c of t.controls) input(c, fs1);
+  const two = el('div', 'two');
+  input({ k: 'w', label: 'Width (of 12 columns)', type: 'number', min: 1, max: 12 }, two);
+  input({ k: 'h', label: 'Height (rows)', type: 'number', min: 1, max: 14 }, two);
+  fs1.append(two);
+  sc.append(fs1);
+
+  if (t.clicks || t.follow) {
+    const fs2 = el('fieldset'); fs2.append(el('legend', null, 'Map interaction'));
+    if (t.clicks) input({ k: 'onClick', label: wg.type === 'map' ? 'When a feature is clicked' : 'When an item is clicked', type: 'select', options: t.clicks }, fs2);
+    if (wg.type === 'map') input({ k: 'followFilters', label: 'Show only the features that match the filters', type: 'check' }, fs2);
+    else {
+      input({ k: 'followFilters', label: 'Update when the map or other widgets filter', type: 'check' }, fs2);
+      input({ k: 'followExtent', label: 'Only include features inside the current map view', type: 'check' }, fs2);
+    }
+    sc.append(fs2);
+  }
+  form.append(sc);
+
+  const foot = el('div', 'foot');
+  const btn = (text, fn, cls) => { const b = el('button', 'btn' + (cls ? ' ' + cls : ''), text); b.type = 'button'; b.onclick = fn; foot.append(b); return b; };
+  const W = S.dash.widgets, i = W.indexOf(wg);
+  btn('◀ Move earlier', () => { if (i > 0) { W.splice(i - 1, 0, W.splice(i, 1)[0]); saveDash(); renderLayout(); buildSettings(id); } }).disabled = i === 0;
+  btn('Move later ▶', () => { if (i < W.length - 1) { W.splice(i + 1, 0, W.splice(i, 1)[0]); saveDash(); renderLayout(); buildSettings(id); } }).disabled = i === W.length - 1;
+  if (!t.single) btn('Remove', () => { removeWidget(wg); $('cfgDlg').close(); }, 'danger');
+  foot.append(el('span', 'gap'));
+  btn('Done', () => $('cfgDlg').close());
+  form.append(foot);
+}
+
+/* apply one settings change: clear the widget's own filter when what it shows changes */
+function changeWidget(wg, k, v, c) {
+  if (k === 'title') { wg.title = v; wg.titleAuto = !v; if (!v) wg.title = titleFor(wg); }
+  else wg[k] = v;
+  if (k === 'field' && wg.type === 'gauge') { const col = S.ds.cols.find(x => x.name === v); wg.value = col && col.values[0]; }
+  if (wg.titleAuto) wg.title = titleFor(wg);
+  const content = !['title', 'w', 'h', 'onClick', 'legend', 'hover', 'text', 'suffix', 'frame'].includes(k);
+  if (content || k === 'onClick') clearSelection(wg.id);
+  saveDash();
+  const rebuildForm = !['text', 'textarea', 'number', 'fields'].includes(c.type);
+  if (['w', 'h'].includes(k) || k === 'title') {
+    const s = document.querySelector(`.wg[data-id="${CSS.escape(wg.id)}"]`);
+    if (s) { s.style.setProperty('--w', wg.w); s.style.setProperty('--h', wg.h); s.querySelector('h2').textContent = wg.title; }
+    return;
+  }
+  renderLayout();
+  if (rebuildForm) buildSettings(wg.id);
+  if (wg.type === 'map') { applyColors(); if (k === 'followFilters') refresh(); else renderLegend(); return; }
+  if (wg.type === 'text' || (!content && k !== 'onClick')) return;
+  refresh();
+}
+
+function removeWidget(wg) {
+  clearSelection(wg.id);
+  S.dash.widgets = S.dash.widgets.filter(w => w !== wg);
+  S.data.delete(wg.id);
+  saveDash(); renderLayout(); refresh();
+}
+
+function openAdd() {
+  const list = $('typeList');
+  list.replaceChildren();
+  for (const [type, t] of Object.entries(TYPES)) {
+    if (t.single) continue;
+    const b = el('button'); b.type = 'button';
+    b.append(icon(TYPE_ICON[type]), el('b', null, t.name), el('span', null, t.about));
+    b.onclick = () => { $('addDlg').close(); addWidget(type); };
+    list.append(b);
+  }
+  $('addDlg').showModal();
+}
+
+/* new widget with sensible fields already chosen */
+function addWidget(type) {
+  const ds = S.ds, t = TYPES[type];
+  const wg = { ...COMMON, ...t.defaults, id: 'w' + Date.now().toString(36), type, w: t.size[0], h: t.size[1], titleAuto: true };
+  const cat = ds.catFields[0], num = ds.numFields[0], date = ds.dateFields[0];
+  if (type === 'indicator') { wg.field = num || null; }
+  if (type === 'category') wg.field = cat || null;
+  if (type === 'histogram') wg.field = num || null;
+  if (type === 'time') wg.field = date || null;
+  if (type === 'gauge') { wg.field = cat || null; const col = ds.cols.find(c => c.name === cat); wg.value = col && col.values[0]; }
+  if (type === 'list') { wg.titleField = cat || 'fid'; wg.sortField = num || 'fid'; }
+  if (type === 'details') { const t = ds.cols.find(c => c.kind === 'str' && c.distinct > 12); wg.titleField = t ? t.name : null; }
+  if (type === 'selector') {
+    wg.field = cat || date || num || null;
+    const col = ds.cols.find(c => c.name === wg.field);
+    wg.style = col && col.kind === 'str' && col.distinct <= 8 ? 'buttons' : 'dropdown';
+    if (wg.style === 'buttons') { wg.w = 4; wg.h = 3; }
+  }
+  wg.title = titleFor(wg);
+  S.dash.widgets.push(wg);
+  saveDash(); renderLayout(); refresh();
+  openSettings(wg.id);
+  const s = document.querySelector(`.wg[data-id="${CSS.escape(wg.id)}"]`);
+  if (s) s.scrollIntoView({ block: 'nearest' });
+}
+
+/* ================================================================
+   9. FILTERS, SELECTIONS AND CLICK ACTIONS
+   ================================================================ */
+const scheduleRefresh = (() => { let t; return (map = true) => { clearTimeout(t); t = setTimeout(() => refresh({ map }), 120); }; })();
+
+/* WHERE for one widget: all filters except its own (if it follows filters), plus the map view (if it follows the view) */
+function whereFor(wg) {
+  const extra = wg.followExtent && S.extent ? extentSql(S.extent) : null;
+  if (wg.followFilters === false) return extra || 'TRUE';
+  return buildWhere(S.filters, wg.id, extra);
+}
+
+/* SQL condition for one clicked item of a widget */
+function predFor(wg, key) {
+  const f = qid(wg.field);
+  switch (wg.type) {
+    case 'category': case 'gauge': case 'selector': return `${catExpr(wg.field)} = ${qstr(key)}`;
+    case 'table': return `fid = ${nz(key)}`;
+    case 'histogram': {
+      const d = S.data.get(wg.id), i = Number(key), lo = d.lo + i * d.w, hi = i === d.bins - 1 ? d.hi : lo + d.w;
+      return `${f} >= ${nz(lo)} AND ${f} ${i === d.bins - 1 ? '<=' : '<'} ${nz(hi)}`;
+    }
+    case 'time': {
+      if (wg.mode !== 'timeline') return `${CYCLES[wg.mode].expr(wg.field)} = ${nz(key)}`;
+      const d = S.data.get(wg.id), t = Number(key);
+      return `${f} >= epoch_ms(CAST(${nz(t)} AS BIGINT)) AND ${f} < epoch_ms(CAST(${nz(nextBucket(t, d.iv))} AS BIGINT))`;
+    }
+    case 'list': return `fid = ${nz(key)}`;
+  }
+  return 'TRUE';
+}
+
+function clearSelection(id) {
+  S.sel.delete(id);
+  S.range.delete(id);
+  S.filters.delete(id);
+  if (S.hl && S.hl.src === id) { S.hl = null; updateHighlight(); }
+}
+
+/* what a click on a bar / slice / bin / row / gauge does, per the widget's settings */
+async function itemClicked(wg, key, text) {
+  try {
+    const how = wg.onClick || 'filter';
+    if (how === 'none') return;
+    key = String(key);
+    if (how === 'filter') {
+      const sel = S.sel.get(wg.id) || new Map();
+      if (sel.has(key)) sel.delete(key); else sel.set(key, text);
+      if (!sel.size) { S.sel.delete(wg.id); S.filters.delete(wg.id); }
+      else {
+        S.sel.set(wg.id, sel);
+        S.filters.set(wg.id, { sql: [...sel.keys()].map(k => `(${predFor(wg, k)})`).join(' OR '), text: `${wg.title || TYPES[wg.type].name}: ${[...sel.values()].join(', ')}` });
+      }
+      return refresh();
+    }
+    const where = `(${whereFor(wg)}) AND (${predFor(wg, key)})`;
+    if (how === 'zoom') return zoomToWhere(where);
+    if (how === 'locate') return pick(Number(key), { fly: true });
+    if (how === 'highlight') {
+      if (S.hl && S.hl.src === wg.id && S.hl.key === key) S.hl = null;
+      else {
+        const t = await qTable(sqlIds(where + ' LIMIT 50000'));
+        S.hl = { src: wg.id, key, ids: Array.from(t.getChildAt(0).toArray()) };
+        if (!S.hl.ids.length) notify('No features to highlight.');
+      }
+      updateHighlight(); renderWidget(wg);
+    }
+  } catch (e) { fail(e); }
+}
+
+function renderChips() {
+  const box = $('chips');
+  box.replaceChildren();
+  for (const [id, f] of S.filters) {
+    const b = el('button', 'chip'); b.type = 'button';
+    const t = el('span', 't', f.text); t.title = f.text;
+    const x = el('span', 'x', '×'); x.setAttribute('aria-hidden', 'true');
+    b.append(t, x); b.setAttribute('aria-label', 'Remove filter: ' + f.text);
+    b.onclick = () => { clearSelection(id); if (id === 'box') drawBox(); if (id === 'map') pick(null); refresh(); };
+    box.append(b);
+  }
+  if (S.filters.size > 1) { const b = el('button', 'chip plain', 'Clear all'); b.type = 'button'; b.onclick = clearAll; box.append(b); }
+  $('filterBar').hidden = !S.filters.size;
+}
+function resetSelections() { S.filters = new Map(); S.sel = new Map(); S.range = new Map(); S.hl = null; drawBox(); updateHighlight(); }
+function clearAll() { resetSelections(); refresh(); }
+
+/* selector widgets: the chosen values (text) or range (number, date) become the widget's filter */
+function setSelectorValues(wg, sel) {
+  if (!sel.size) clearSelection(wg.id);
+  else {
+    S.sel.set(wg.id, sel);
+    S.filters.set(wg.id, { sql: [...sel.keys()].map(k => `(${predFor(wg, k)})`).join(' OR '), text: `${label(wg.field)}: ${[...sel.values()].join(', ')}` });
+  }
+  refresh();
+}
+function setSelectorRange(wg, lo, hi, d) {
+  const f = qid(wg.field);
+  if (lo <= d.lo && hi >= d.hi) clearSelection(wg.id);
+  else if (d.kind === 'date') {
+    const end = hi + DAY;                         // the "to" day is included
+    S.range.set(wg.id, [lo, hi]);
+    const day = t => new Date(t).toLocaleDateString(undefined, { timeZone: 'UTC', day: 'numeric', month: 'short', year: 'numeric' });
+    S.filters.set(wg.id, { sql: `${f} >= epoch_ms(CAST(${nz(lo)} AS BIGINT)) AND ${f} < epoch_ms(CAST(${nz(end)} AS BIGINT))`, text: `${label(wg.field)}: ${day(lo)} to ${day(hi)}` });
+  } else {
+    S.range.set(wg.id, [lo, hi]);
+    S.filters.set(wg.id, { sql: `${f} BETWEEN ${nz(lo)} AND ${nz(hi)}`, text: `${label(wg.field)}: ${fmt(lo)} to ${fmt(hi)}` });
+  }
+  refresh();
+}
+
+/* ================================================================
+   10. REFRESH: filters -> one query per widget -> render
+   ================================================================ */
+async function refresh(opts = {}) {
+  if (!S.fc) return;
+  // a newer refresh cancels an older one; if the older one was a full refresh that had not
+  // finished, the newer one must be full too, or widgets it had not reached stay stale
+  if (opts.map === false && S.fullPending) opts = {};
+  if (opts.map !== false) S.fullPending = true;
+  const my = ++S.seq, stale = () => my !== S.seq;
+  try {
+    if (opts.map !== false) {
+      const mw = mapCfg(), mWhere = mw.followFilters === false ? 'TRUE' : buildWhere(S.filters, 'map', null);
+      let ids = null;
+      if (mWhere !== 'TRUE') { const t = await qTable(sqlIds(mWhere)); if (stale()) return; ids = t.getChildAt(0).toArray(); }
+      updateMap(ids);
+      if (S.pick != null && ids && !ids.includes(S.pick) && !S.filters.has('map')) { S.pick = null; closePopup(); updateHighlight(); }
+    }
+    renderChips();
+    for (const wg of S.dash.widgets) {
+      if (wg.type === 'map' || wg.type === 'text') continue;
+      if (opts.map === false && !wg.followExtent) continue;       // map moved: only view-following widgets change
+      const d = missingFields(wg).length ? null : await widgetData(wg);
+      if (stale()) return;
+      S.data.set(wg.id, d);
+      renderWidget(wg);
+    }
+    if (opts.map !== false) S.fullPending = false;
+  } catch (e) { fail(e); }
+}
+
+/* a field as display text (dates, text) or a number, for lists and tables */
+const disp = n => !n ? "''" : kindOf(n) === 'date' ? `strftime(${qid(n)}, '%Y-%m-%d %H:%M')` : kindOf(n) === 'num' || n === 'fid' ? `CAST(${qid(n)} AS DOUBLE)` : `CAST(${qid(n)} AS VARCHAR)`;
+const sortSql = wg => (kindOf(wg.sortField) === 'str' ? `${qid(wg.sortField)} COLLATE NOCASE` : qid(wg.sortField)) + (wg.order === 'asc' ? ' ASC' : ' DESC');
+const tableCols = wg => ((wg.columns && wg.columns.length) ? wg.columns : S.ds.cols.slice(0, 8).map(c => c.name)).filter(hasField);
+
+/* one widget's numbers: current (filtered) values plus unfiltered "all features" values */
+async function widgetData(wg) {
+  const w = whereFor(wg), f = wg.field;
+  switch (wg.type) {
+    case 'indicator': {
+      const agg = aggSql(wg.stat, wg.field);
+      const loc = (wg.stat === 'min' || wg.stat === 'max') && f ? `, ${wg.stat === 'min' ? 'arg_min' : 'arg_max'}(fid, ${qid(f)}) AS fid` : '';
+      const r = (await q(`SELECT ${agg} AS v${loc} FROM f WHERE ${w}`))[0];
+      if (wg.reference === 'all') r.ref = (await cached(`SELECT ${agg} AS v FROM f`))[0].v;
+      return r;
+    }
+    case 'category': {
+      const agg = aggSql(wg.stat, wg.valueField);
+      await colorsFor(f);
+      const cur = await q(`SELECT ${catExpr(f)} AS k, ${agg} AS v FROM f WHERE ${w} GROUP BY 1`);
+      const base = await cached(`SELECT ${catExpr(f)} AS k, ${agg} AS v FROM f GROUP BY 1 ORDER BY v DESC NULLS LAST, k`);
+      return { cur: new Map(cur.map(r => [r.k, r.v])), base };
+    }
+    case 'histogram': {
+      let { lo, hi } = await rangeFor(f);
+      if (lo == null) { lo = 0; hi = 1; }
+      if (hi === lo) hi = lo + 1;
+      const bins = wg.bins || 12, bw = (hi - lo) / bins;
+      const cur = await q(sqlHist(f, lo, bw, bins, w)), base = await cached(sqlHist(f, lo, bw, bins, 'TRUE'));
+      const arr = rows => { const a = new Array(bins).fill(0); for (const r of rows) if (r.b >= 0 && r.b < bins) a[r.b] = r.n; return a; };
+      return { lo, hi, w: bw, bins, cur: arr(cur), base: arr(base) };
+    }
+    case 'time': {
+      const agg = aggSql(wg.stat, wg.valueField);
+      if (wg.mode !== 'timeline') {
+        const C = CYCLES[wg.mode], ex = C.expr(f);
+        const sql = cond => `SELECT ${ex} AS k, ${agg} AS v FROM f WHERE ${qid(f)} IS NOT NULL AND (${cond}) GROUP BY 1`;
+        const cur = await q(sql(w)), base = await cached(sql('TRUE'));
+        return { keys: C.keys, label: C.label, cur: new Map(cur.map(r => [r.k, r.v])), base: new Map(base.map(r => [r.k, r.v])) };
+      }
+      const rg = (await cached(`SELECT epoch_ms(MIN(${qid(f)})) AS lo, epoch_ms(MAX(${qid(f)})) AS hi FROM f`))[0];
+      if (rg.lo == null) return { empty: true };
+      let iv = wg.interval === 'auto' ? autoInterval(rg.lo, rg.hi) : wg.interval;
+      const order = ['hour', 'day', 'week', 'month', 'year'];
+      let keys;
+      for (;;) {              // too many buckets for the chosen interval: step up to a coarser one
+        const start = (await cached(`SELECT epoch_ms(date_trunc('${iv}', MIN(${qid(f)}))) AS s FROM f`))[0].s;
+        keys = [];
+        for (let t = start; t <= rg.hi && keys.length <= 400; t = nextBucket(t, iv)) keys.push(t);
+        if (keys.length <= 400 || iv === 'year') break;
+        iv = order[order.indexOf(iv) + 1];
+      }
+      const sql = cond => `SELECT epoch_ms(date_trunc('${iv}', ${qid(f)})) AS k, ${agg} AS v FROM f WHERE ${qid(f)} IS NOT NULL AND (${cond}) GROUP BY 1`;
+      const cur = await q(sql(w)), base = await cached(sql('TRUE'));
+      return { iv, keys, label: t => bucketLabel(t, iv), cur: new Map(cur.map(r => [r.k, r.v])), base: new Map(base.map(r => [r.k, r.v])) };
+    }
+    case 'gauge': {
+      const r = (await q(`SELECT COUNT(*) AS n, COUNT(*) FILTER (WHERE ${catExpr(f)} = ${qstr(wg.value ?? '')}) AS m FROM f WHERE ${w}`))[0];
+      return r;
+    }
+    case 'table': {
+      const cols = tableCols(wg);
+      const rows = await q(`SELECT fid${cols.map((n, i) => `, ${disp(n)} AS c${i}`).join('')}, COUNT(*) OVER () AS total
+                            FROM f WHERE ${w} ORDER BY ${sortSql(wg)} NULLS LAST, fid LIMIT ${Math.round(wg.limit || 500)}`);
+      return { cols, rows, total: rows.length ? rows[0].total : (await q(`SELECT COUNT(*) AS n FROM f WHERE ${w}`))[0].n };
+    }
+    case 'details': {
+      const n = (await q(`SELECT COUNT(*) AS n FROM f WHERE ${w}`))[0].n;
+      const i = Math.max(0, Math.min(n - 1, S.detail.get(wg.id) || 0));
+      S.detail.set(wg.id, i);
+      const r = n ? (await q(`SELECT fid FROM f WHERE ${w} ORDER BY fid LIMIT 1 OFFSET ${i}`))[0] : null;
+      return { n, i, fid: r ? r.fid : null };
+    }
+    case 'selector': {
+      const kind = kindOf(f);
+      const n = (await q(`SELECT COUNT(*) AS n FROM f WHERE ${w}`))[0].n;
+      if (kind === 'str') {
+        const cur = await q(`SELECT ${catExpr(f)} AS k, COUNT(*) AS v FROM f WHERE ${w} GROUP BY 1`);
+        return { kind, n, base: await cached(sqlCats(f, 'TRUE')), cur: new Map(cur.map(r => [r.k, r.v])) };
+      }
+      if (kind === 'date') {
+        const r = (await cached(`SELECT epoch_ms(date_trunc('day', MIN(${qid(f)}))) AS lo, epoch_ms(date_trunc('day', MAX(${qid(f)}))) AS hi FROM f`))[0];
+        return { kind, n, lo: r.lo, hi: r.hi };
+      }
+      const r = await rangeFor(f);
+      return { kind: 'num', n, lo: r.lo, hi: r.hi };
+    }
+    case 'list': {
+      const cf = mapCfg().shade === 'category' && mapCfg().shadeField && hasField(mapCfg().shadeField) ? mapCfg().shadeField : null;
+      if (cf) await colorsFor(cf);
+      const sort = kindOf(wg.sortField) === 'str' ? `${qid(wg.sortField)} COLLATE NOCASE` : qid(wg.sortField);
+      const rows = await q(`SELECT fid, ${disp(wg.titleField)} AS t, ${disp(wg.subField)} AS s, ${disp(wg.sortField)} AS v, ${cf ? catExpr(cf) : "''"} AS c, COUNT(*) OVER () AS total
+                            FROM f WHERE ${w} ORDER BY ${sort} ${wg.order === 'asc' ? 'ASC' : 'DESC'} NULLS LAST, fid LIMIT ${Math.round(wg.limit || 100)}`);
+      return { rows, total: rows.length ? rows[0].total : 0, cf };
+    }
+  }
+  return null;
+}
+
+/* ================================================================
+   11. WIDGET RENDERERS (plain DOM and SVG, no chart library)
+   ================================================================ */
+function renderAll() { if (S.dash) for (const wg of S.dash.widgets) renderWidget(wg); }
+
+function renderWidget(wg) {
+  const body = S.bodies.get(wg.id);
+  if (!body || wg.type === 'map') return;
+  body.replaceChildren();
+  if (wg.type === 'text') { body.append(el('div', 'textw', wg.text || '')); return; }
+  const miss = missingFields(wg);
+  if (miss.length) {
+    const m = el('div', 'missing');
+    m.append(miss[0] ? `This widget uses the field “${miss[0]}”, which this layer does not have.` : 'Choose a field for this widget.', el('br'), 'Open ⚙ in Edit layout to choose one.');
+    body.append(m); return;
+  }
+  const d = S.data.get(wg.id);
+  if (!d) return;
+  ({ indicator: drawIndicator, category: drawCategory, histogram: drawHistogram, time: drawTime, gauge: drawGauge, list: drawList,
+     table: drawTable, details: drawDetails, selector: drawSelector })[wg.type](body, wg, d);
+}
+
+/* re-query and redraw one widget (sorting, paging) */
+async function refreshOne(wg) {
+  try { S.data.set(wg.id, await widgetData(wg)); renderWidget(wg); } catch (e) { fail(e); }
+}
+
+// whole numbers as stored (years, codes and IDs must not get thousands separators), as in the popup
+const showVal = (n, v) => v == null || v === '' ? '–' : (typeof v === 'number' && !Number.isInteger(v) ? fmt(v) : String(v));
+
+function drawTable(body, wg, d) {
+  const wrap = el('div', 'tbl'), bar = el('div', 'tblbar'), sel = selOf(wg);
+  bar.append(el('p', 'note', d.total > d.rows.length ? `${fmtInt(d.rows.length)} of ${fmtInt(d.total)} features` : `${fmtInt(d.total)} features`));
+  const csv = el('button', 'btn sm'); csv.type = 'button'; csv.append(icon('download'), 'CSV');
+  csv.title = 'Export these rows, with every row that matches (not only those shown), as CSV';
+  csv.onclick = () => exportCsv(whereFor(wg), d.cols, wg).catch(fail);
+  bar.append(csv);
+  const box = el('div', 'tblwrap'), table = el('table'), thead = el('thead'), hr = el('tr'), tb = el('tbody');
+  for (const n of d.cols) {
+    const th = el('th', kindOf(n) === 'num' || n === 'fid' ? 'num' : null), b = el('button');
+    b.type = 'button';
+    b.append(n === 'fid' ? 'Feature ID' : label(n));
+    if (wg.sortField === n) b.append(el('span', 'arr', wg.order === 'asc' ? '▲' : '▼'));
+    b.title = 'Sort by ' + label(n);
+    b.onclick = () => {
+      if (wg.sortField === n) wg.order = wg.order === 'asc' ? 'desc' : 'asc';
+      else { wg.sortField = n; wg.order = kindOf(n) === 'str' ? 'asc' : 'desc'; }
+      saveDash(); refreshOne(wg);
+    };
+    th.append(b); hr.append(th);
+  }
+  thead.append(hr);
+  for (const r of d.rows) {
+    const tr = el('tr', r.fid === S.pick || sel.has(String(r.fid)) ? 'on' : null);
+    d.cols.forEach((n, i) => { const td = el('td', kindOf(n) === 'num' || n === 'fid' ? 'num' : null, showVal(n, r['c' + i])); td.title = td.textContent; tr.append(td); });
+    tr.onclick = () => itemClicked(wg, r.fid, `Feature ${r.fid}`);
+    if (wg.hover !== false) {
+      tr.addEventListener('pointerenter', () => { S.hover = r.fid; updateHighlight(); });
+      tr.addEventListener('pointerleave', () => { if (S.hover === r.fid) { S.hover = null; updateHighlight(); } });
+    }
+    tb.append(tr);
+  }
+  table.append(thead, tb); box.append(table);
+  if (!d.rows.length) box.append(el('p', 'note', ' No features match.'));
+  wrap.append(bar, box);
+  body.append(wrap);
+}
+
+function drawDetails(body, wg, d) {
+  const picked = S.pick != null && S.fc.features[S.pick], fid = picked ? S.pick : d.fid;
+  const wrap = el('div', 'det'), bar = el('div', 'detbar');
+  const btn = (ic, title, fn, dis) => { const b = el('button', 'btn icon sm'); b.type = 'button'; b.append(icon(ic)); b.title = title; b.setAttribute('aria-label', title); b.onclick = fn; b.disabled = !!dis; bar.append(b); return b; };
+  if (picked) {
+    const pos = el('span', 'pos'); pos.append(el('span', 'badge', 'Picked feature'));
+    bar.append(pos);
+    btn('x', 'Back to the filtered features', () => pick(null));
+  } else {
+    bar.append(el('span', 'pos', d.n ? `${fmtInt(d.i + 1)} of ${fmtInt(d.n)}` : 'No features match'));
+    btn('prev', 'Previous feature', () => { S.detail.set(wg.id, d.i - 1); refreshOne(wg); }, d.i <= 0);
+    btn('next', 'Next feature', () => { S.detail.set(wg.id, d.i + 1); refreshOne(wg); }, d.i >= d.n - 1);
+  }
+  if (fid != null) btn('target', 'Zoom to this feature', () => pick(fid, { fly: true }));
+  wrap.append(bar);
+  if (fid != null) {
+    const p = S.fc.features[fid].properties;
+    const head = wg.titleField && hasField(wg.titleField) && wg.titleField !== 'fid' ? showVal(wg.titleField, p[wg.titleField]) : `Feature ${fid}`;
+    wrap.append(el('h3', null, head));
+    const dl = el('dl');
+    const names = (wg.fields && wg.fields.length ? wg.fields : [...S.ds.cols.map(c => c.name), ...S.ds.numFields.filter(n => DERIVED[n])]).filter(hasField);
+    for (const n of names) dl.append(el('dt', null, label(n)), el('dd', null, p[n] == null ? '–' : typeof p[n] === 'number' && !Number.isInteger(p[n]) ? fmt(p[n]) : String(p[n])));
+    wrap.append(dl);
+  }
+  body.append(wrap);
+}
+
+function drawSelector(body, wg, d) {
+  const wrap = el('div', 'selw'), foot = el('div', 'selfoot');
+  const reset = el('button', 'linkbtn', 'Reset'); reset.type = 'button';
+  reset.onclick = () => { clearSelection(wg.id); refresh(); };
+  const active = S.filters.has(wg.id);
+  foot.append(el('span', null, `${fmtInt(d.n)} features`));
+  if (active) foot.append(reset);
+
+  if (d.kind === 'str') {
+    const sel = selOf(wg);
+    const keys = d.base.map(r => r.k);
+    if (wg.style === 'buttons') {
+      wrap.classList.add('btns');
+      const opts = el('div', 'opts');
+      for (const k of keys) {
+        const n = d.cur.get(k) || 0, b = el('button', 'opt' + (sel.has(k) ? ' on' : '') + (n ? '' : ' zero'));
+        b.type = 'button'; b.append(el('span', null, k), el('span', 'n', fmtInt(n)));
+        b.setAttribute('aria-pressed', String(sel.has(k)));
+        b.onclick = () => { const s = new Map(sel); if (s.has(k)) s.delete(k); else s.set(k, k); setSelectorValues(wg, s); };
+        opts.append(b);
+      }
+      wrap.append(opts);
+    } else {
+      const s = el('select', 'sel'); s.setAttribute('aria-label', wg.title);
+      const all = el('option', null, `All values`); all.value = ''; s.append(all);
+      for (const k of keys) { const o = el('option', null, `${k}  (${fmtInt(d.cur.get(k) || 0)})`); o.value = k; s.append(o); }
+      s.value = sel.size ? [...sel.keys()][0] : '';
+      s.onchange = () => setSelectorValues(wg, s.value ? new Map([[s.value, s.value]]) : new Map());
+      wrap.append(s);
+    }
+    wrap.append(foot);
+    body.append(wrap);
+    return;
+  }
+  if (d.lo == null) { body.append(el('p', 'note', 'This field has no values.')); return; }
+  const [a, b] = S.range.get(wg.id) || [d.lo, d.hi];
+  if (d.kind === 'date') {
+    const iso = t => new Date(t).toISOString().slice(0, 10);
+    const box = el('div', 'dates'), mk = (text, v) => { const l = el('label', null, text), i = el('input'); i.type = 'date'; i.min = iso(d.lo); i.max = iso(d.hi); i.value = iso(v); l.append(i); box.append(l); return i; };
+    const from = mk('From', a), to = mk('To', b);
+    const apply = () => {
+      let lo = from.valueAsNumber, hi = to.valueAsNumber;
+      if (!Number.isFinite(lo)) lo = d.lo;
+      if (!Number.isFinite(hi)) hi = d.hi;
+      if (lo > hi) [lo, hi] = [hi, lo];
+      setSelectorRange(wg, lo, hi, d);
+    };
+    from.onchange = to.onchange = apply;
+    wrap.append(box, foot);
+    body.append(wrap);
+    return;
+  }
+  // number: two thumbs on one track
+  const span = d.hi - d.lo || 1;
+  const step = Number.isInteger(d.lo) && Number.isInteger(d.hi) && span >= 20 ? Math.max(1, Math.round(span / 200)) : span / 200;   // whole numbers stay whole
+  const rng = el('div', 'range'), track = el('div', 'rtrack'), fillEl = el('div', 'rfill');
+  const vals = el('div', 'rvals'), va = el('b'), vb = el('b');
+  vals.append(va, vb);
+  const mk = v => { const i = el('input'); i.type = 'range'; i.min = d.lo; i.max = d.hi; i.step = step; i.value = v; return i; };
+  const lo = mk(a), hi = mk(b);
+  lo.setAttribute('aria-label', label(wg.field) + ' from'); hi.setAttribute('aria-label', label(wg.field) + ' to');
+  const paint = () => {
+    const x = Math.min(+lo.value, +hi.value), y = Math.max(+lo.value, +hi.value);
+    fillEl.style.left = ((x - d.lo) / span * 100) + '%'; fillEl.style.right = (100 - (y - d.lo) / span * 100) + '%';
+    va.textContent = fmt(x); vb.textContent = fmt(y);
+  };
+  const commit = () => {
+    let x = Math.min(+lo.value, +hi.value), y = Math.max(+lo.value, +hi.value);
+    if (x - d.lo < step / 2) x = d.lo;           // the ends of the track mean "no limit"
+    if (d.hi - y < step / 2) y = d.hi;
+    setSelectorRange(wg, x, y, d);
+  };
+  lo.oninput = hi.oninput = paint;
+  lo.onchange = hi.onchange = commit;
+  rng.append(track, fillEl, lo, hi);
+  paint();
+  wrap.append(vals, rng, foot);
+  body.append(wrap);
+}
+
+const selOf = wg => S.sel.get(wg.id) || new Map();
+const hlKey = wg => (S.hl && S.hl.src === wg.id ? S.hl.key : null);
+const pickVal = field => (S.pick != null && S.fc.features[S.pick] ? S.fc.features[S.pick].properties[field] : undefined);
+const valText = (wg, v) => (wg.stat && wg.stat !== 'count' ? `${STAT_NAME[wg.stat].toLowerCase()} ${label(wg.valueField)} ${fmt(v)}` : `${fmtInt(v)} features`);
+
+function drawIndicator(body, wg, d) {
+  const b = el('button', 'ind'); b.type = 'button';
+  const inert = wg.onClick === 'none' || (wg.onClick === 'locate' && d.fid == null);
+  if (inert) b.classList.add('inert');
+  const v = wg.stat === 'count' ? fmtInt(d.v) : fmt(d.v);
+  let cap = wg.stat === 'count' ? 'features' : `${STAT_NAME[wg.stat].toLowerCase()} of ${label(wg.field)}`;
+  if (wg.reference === 'all' && d.ref != null) cap = d.v === d.ref ? `${cap} · all features` : `${cap} · ${fmt(d.v / d.ref * 100)}% of ${fmt(d.ref)} for all`;
+  b.append(el('span', 'v', v + (wg.suffix ? ' ' + wg.suffix : '')), el('span', 'l', cap));
+  tipOn(b, `${wg.title}: ${v}${wg.suffix ? ' ' + wg.suffix : ''}\n` + ({ zoom: 'Click to zoom the map to these features', locate: 'Click to locate this feature', none: '' })[wg.onClick]);
+  b.onclick = () => {
+    if (wg.onClick === 'zoom') zoomToWhere(whereFor(wg)).catch(fail);
+    else if (wg.onClick === 'locate' && d.fid != null) pick(d.fid, { fly: true });
+  };
+  body.append(b);
+}
+
+/* category chart: groups ordered by their unfiltered value, selected groups always shown */
+function drawCategory(body, wg, d) {
+  const sel = selOf(wg), hk = hlKey(wg), pv = pickVal(wg.field), pickKey = pv === undefined ? null : String(pv ?? '(blank)');
+  const keys = d.base.slice(0, wg.max || 12).map(r => r.k);
+  for (const k of sel.keys()) if (!keys.includes(k)) keys.push(k);
+  const baseMap = new Map(d.base.map(r => [r.k, r.v]));
+  const byCat = wg.chart === 'pie' || wg.chart === 'donut' || wg.colors === 'category';
+  const items = keys.map(k => ({
+    key: k, label: k, v: d.cur.get(k) || 0, base: baseMap.get(k) || 0, on: sel.has(k), mark: k === hk || k === pickKey,
+    color: byCat ? colorOf(wg.field, k) : null
+  }));
+  const more = d.base.length - Math.min(d.base.length, wg.max || 12);
+  for (const it of items) it.tip = `${it.label}\n${valText(wg, it.v)}` + (it.v !== it.base ? `\n${valText(wg, it.base)} without filters` : '');
+  const click = it => itemClicked(wg, it.key, it.label);
+  if (wg.chart === 'pie' || wg.chart === 'donut') drawPie(body, items, { donut: wg.chart === 'donut', filtering: sel.size > 0, click, stat: wg.stat });
+  else if (wg.chart === 'column') drawColumns(body, items, { filtering: sel.size > 0, click, labels: true });
+  else drawBars(body, items, { filtering: sel.size > 0, click, stat: wg.stat });
+  if (more > 0) body.lastChild.append(el('p', 'note', `Top ${keys.length} of ${d.base.length} groups.`));
+}
+
+function drawBars(body, items, o) {
+  const box = el('div', 'bars' + (o.filtering ? ' filtering' : ''));
+  const max = Math.max(1e-9, ...items.map(i => Math.max(i.base, i.v)));
+  for (const it of items) {
+    const b = el('button', 'bar' + (it.on ? ' on' : '') + (it.mark ? ' mark' : '')); b.type = 'button';
+    const lab = el('span', 'lab', it.label);
+    const tr = el('span', 'track'), g = el('span', 'ghost'), f = el('span', 'fill');
+    g.style.width = (Math.max(0, it.base) / max * 100) + '%';
+    f.style.width = (Math.max(0, it.v) / max * 100) + '%';
+    if (it.color) f.style.background = it.color;
+    tr.append(g, f);
+    b.append(lab, tr, el('span', 'cnt', o.stat && o.stat !== 'count' ? fmt(it.v) : fmtInt(it.v)));
+    b.setAttribute('aria-pressed', String(!!it.on));
+    tipOn(b, it.tip);
+    b.onclick = () => o.click(it);
+    box.append(b);
+  }
+  if (!items.length) box.append(el('p', 'note', 'No values.'));
+  body.append(box);
+}
+
+/* columns with a recessive value axis; line mode draws the current values as a 2px line */
+function drawColumns(body, items, o) {
+  const wrap = el('div', 'cols' + (o.line ? ' line' : '') + (o.filtering ? ' filtering' : ''));
+  const plot = el('div', 'plot');
+  const max = Math.max(1e-9, ...items.map(i => Math.max(i.base, i.v)));
+  const t = ticks(0, max, 2);
+  for (const v of t.values) { const gl = el('div', 'gl'); gl.style.bottom = (v / max * 100) + '%'; gl.dataset.v = fmt(v); plot.append(gl); }
+  const row = el('div', 'colrow');
+  for (const it of items) {
+    const b = el('button', 'col' + (it.on ? ' on' : '') + (it.mark ? ' mark' : '')); b.type = 'button';
+    const g = el('span', 'cg'), f = el('span', 'cf');
+    g.style.height = (Math.max(0, it.base) / max * 100) + '%';
+    if (!o.line) { f.style.height = (Math.max(0, it.v) / max * 100) + '%'; if (it.color) f.style.background = it.color; b.append(g, f); }
+    else b.append(g);
+    b.setAttribute('aria-pressed', String(!!it.on));
+    tipOn(b, it.tip);
+    b.onclick = () => o.click(it);
+    row.append(b);
+  }
+  plot.append(row);
+  if (o.line && items.length) {
+    const n = items.length, svg = svgEl('svg', { class: 'lineSvg', viewBox: `0 0 ${n} 100`, preserveAspectRatio: 'none' });
+    const pts = items.map((it, i) => `${i + 0.5},${100 - Math.max(0, it.v) / max * 100}`).join(' ');
+    svg.append(svgEl('polyline', { points: pts, fill: 'none', stroke: cssVar('--bar'), 'stroke-width': 2, 'vector-effect': 'non-scaling-stroke', 'stroke-linejoin': 'round' }));
+    plot.append(svg);
+  }
+  wrap.append(plot);
+  if (o.labels) { const xl = el('div', 'xlabs'); for (const it of items) { const s = el('span', null, it.label); s.title = it.label; xl.append(s); } wrap.append(xl); }
+  if (o.axis) { const ax = el('div', 'xaxis'); for (const l of o.axis) ax.append(el('span', null, l)); wrap.append(ax); }
+  body.append(wrap);
+}
+
+function drawPie(body, items, o) {
+  const wrap = el('div', 'pie' + (o.filtering ? ' filtering' : ''));
+  const total = items.reduce((s, i) => s + Math.max(0, i.v), 0);
+  const svg = svgEl('svg', { viewBox: '-1.05 -1.05 2.1 2.1', role: 'img' });
+  const P = (r, a) => [r * Math.sin(a), -r * Math.cos(a)];
+  const r0 = o.donut ? 0.56 : 0;
+  let a = 0;
+  for (const it of items) {
+    if (!(it.v > 0) || !total) continue;
+    const a1 = a + Math.min(it.v / total * 2 * Math.PI, 2 * Math.PI - 1e-4), large = a1 - a > Math.PI ? 1 : 0;
+    const [x0, y0] = P(1, a), [x1, y1] = P(1, a1);
+    const dpath = r0
+      ? (() => { const [x2, y2] = P(r0, a1), [x3, y3] = P(r0, a); return `M${x0} ${y0}A1 1 0 ${large} 1 ${x1} ${y1}L${x2} ${y2}A${r0} ${r0} 0 ${large} 0 ${x3} ${y3}Z`; })()
+      : `M0 0L${x0} ${y0}A1 1 0 ${large} 1 ${x1} ${y1}Z`;
+    const p = svgEl('path', { d: dpath, fill: it.color || cssVar('--bar') });
+    if (it.on) p.classList.add('on');
+    p.addEventListener('pointermove', e => showTip(e, it.tip + `\n${fmt(it.v / total * 100)}% of the shown total`));
+    p.addEventListener('pointerleave', hideTip);
+    p.addEventListener('click', () => o.click(it));
+    svg.append(p);
+    a = a1;
+  }
+  if (!total) svg.append(svgEl('circle', { r: 0.78, fill: 'none', stroke: cssVar('--track'), 'stroke-width': r0 ? 0.44 : 1.56 }));
+  const leg = el('div', 'leg');
+  for (const it of items) {
+    const b = el('button', it.on ? 'on' : ''); b.type = 'button';
+    const sw = el('i'); sw.style.background = it.color || cssVar('--bar');
+    const lab = el('span', null, it.label); lab.style.overflow = 'hidden'; lab.style.textOverflow = 'ellipsis'; lab.style.whiteSpace = 'nowrap';
+    b.append(sw, lab, el('span', 'n', total ? `${fmt(it.v / total * 100)}%` : '–'));
+    if (it.mark) b.style.boxShadow = 'inset 3px 0 0 var(--sel)';
+    b.setAttribute('aria-pressed', String(!!it.on));
+    tipOn(b, it.tip);
+    b.onclick = () => o.click(it);
+    leg.append(b);
+  }
+  wrap.append(svg, leg);
+  body.append(wrap);
+}
+
+function drawHistogram(body, wg, d) {
+  const sel = selOf(wg), hk = hlKey(wg), pv = pickVal(wg.field);
+  const pickBin = typeof pv === 'number' ? Math.min(d.bins - 1, Math.max(0, Math.floor((pv - d.lo) / d.w))) : -1;
+  const items = d.cur.map((v, i) => {
+    const a = d.lo + i * d.w, b = i === d.bins - 1 ? d.hi : a + d.w, key = String(i);
+    return { key, label: `${fmt(a)} to ${fmt(b)}`, v, base: d.base[i], on: sel.has(key), mark: key === hk || i === pickBin,
+      tip: `${label(wg.field)} ${fmt(a)} to ${fmt(b)}\n${fmtInt(v)} features` + (v !== d.base[i] ? `\n${fmtInt(d.base[i])} without filters` : '') };
+  });
+  drawColumns(body, items, { filtering: sel.size > 0, click: it => itemClicked(wg, it.key, `${label(wg.field)} ${it.label}`), axis: [fmt(d.lo), fmt(d.hi)] });
+}
+
+function drawTime(body, wg, d) {
+  if (d.empty) { body.append(el('p', 'note', 'This date field has no values.')); return; }
+  const sel = selOf(wg), hk = hlKey(wg);
+  const items = d.keys.map(k => {
+    const key = String(k), v = d.cur.get(k) || 0, base = d.base.get(k) || 0, lab = d.label(k);
+    return { key, label: lab, v, base, on: sel.has(key), mark: key === hk, tip: `${lab}\n${valText(wg, v)}` + (v !== base ? `\n${valText(wg, base)} without filters` : '') };
+  });
+  const n = items.length, mid = items[Math.floor((n - 1) / 2)];
+  drawColumns(body, items, { line: wg.chart === 'line', filtering: sel.size > 0, click: it => itemClicked(wg, it.key, it.label),
+    axis: n > 2 ? [items[0].label, mid.label, items[n - 1].label] : items.map(i => i.label) });
+}
+
+function drawGauge(body, wg, d) {
+  const on = selOf(wg).has(String(wg.value)), pct = d.n ? d.m / d.n : 0;
+  const b = el('button', 'gauge' + (on ? ' on' : '')); b.type = 'button';
+  const svg = svgEl('svg', { viewBox: '-1 -1 2 2' }), r = 0.78, c = 2 * Math.PI * r;
+  svg.append(svgEl('circle', { r, fill: 'none', stroke: cssVar('--track'), 'stroke-width': 0.2 }));
+  svg.append(svgEl('circle', { r, fill: 'none', stroke: on ? cssVar('--sel') : (colorOf(wg.field, wg.value) === OTHER_COLOR ? cssVar('--bar') : colorOf(wg.field, wg.value)), 'stroke-width': 0.2,
+    'stroke-dasharray': `${pct * c} ${c}`, transform: 'rotate(-90)', 'stroke-linecap': pct > 0 && pct < 1 ? 'round' : 'butt' }));
+  const txt = el('span', 'txt');
+  txt.append(el('span', 'pct', d.n ? `${fmt(pct * 100)}%` : '–'), el('span', 'sub', `${fmtInt(d.m)} of ${fmtInt(d.n)} features`));
+  b.append(svg, txt);
+  tipOn(b, `${label(wg.field)} = ${wg.value}\n${fmtInt(d.m)} of ${fmtInt(d.n)} features (${fmt(pct * 100)}%)`);
+  b.onclick = () => itemClicked(wg, wg.value, `${wg.value}`);
+  if (wg.onClick === 'none') b.style.cursor = 'default';
+  body.append(b);
+}
+
+function drawList(body, wg, d) {
+  const wrap = el('div', 'list'), rows = el('div', 'rows'), sel = selOf(wg);
+  for (const r of d.rows) {
+    const b = el('button', 'li' + (r.fid === S.pick || sel.has(String(r.fid)) ? ' on' : '')); b.type = 'button';
+    const dot = el('i'); dot.style.background = d.cf ? colorOf(d.cf, r.c) : cssVar('--bar');
+    const show = (n, v) => v == null || v === '' ? '–' : (kindOf(n) === 'num' ? fmt(v) : String(v));
+    const t = el('span', 't', wg.titleField === 'fid' ? 'Feature ' + r.fid : show(wg.titleField, r.t));
+    const v = el('span', 'v', wg.sortField !== wg.titleField && wg.sortField !== 'fid' ? show(wg.sortField, r.v) : '');
+    b.append(dot, t, v);
+    if (wg.subField) b.append(el('span', 's', show(wg.subField, r.s)));
+    b.onclick = () => itemClicked(wg, r.fid, t.textContent);
+    if (wg.hover !== false) {
+      b.addEventListener('pointerenter', () => { S.hover = r.fid; updateHighlight(); });
+      b.addEventListener('pointerleave', () => { if (S.hover === r.fid) { S.hover = null; updateHighlight(); } });
+    }
+    rows.append(b);
+  }
+  if (!d.rows.length) rows.append(el('p', 'note', 'No features match.'));
+  wrap.append(el('p', 'note', d.total > d.rows.length ? `${fmtInt(d.rows.length)} of ${fmtInt(d.total)} features` : `${fmtInt(d.total)} features`), rows);
+  wrap.firstChild.style.margin = '0 0 6px';
+  body.append(wrap);
+}
+
+/* ================================================================
+   12. LAYOUT FILES AND EXPORT
+   ================================================================ */
+/* desktop build (Electron): native dialogs and menu; in a browser these paths are skipped */
+const DESKTOP = !!window.desktop;
+const asFiles = arr => (arr || []).map(f => new File([f.data], f.name));
+
+const SAVE_FILTERS = {
+  json: [{ name: 'Dashboard layout', extensions: ['json'] }], geojson: [{ name: 'GeoJSON', extensions: ['geojson', 'json'] }],
+  csv: [{ name: 'CSV (Excel)', extensions: ['csv'] }], png: [{ name: 'PNG image', extensions: ['png'] }]
+};
+/* data is text or a Uint8Array */
+async function download(name, data, type) {
+  if (DESKTOP) {
+    const p = await window.desktop.save(name, data, SAVE_FILTERS[name.split('.').pop()]);
+    if (p) notify('Saved to ' + p, 'info', 6000);
+    return !!p;
+  }
+  const a = el('a'); a.href = URL.createObjectURL(new Blob([data], { type })); a.download = name;
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  return true;
+}
+async function saveLayoutFile() {
+  const clean = { version: 1, title: S.dash.title, widgets: S.dash.widgets.map(w => ({ ...w })) };
+  if (await download('dashboard.json', JSON.stringify(clean, null, 2), 'application/json') && !DESKTOP)
+    notify('Saved dashboard.json. Put it next to index.html to make it the default layout for everyone.', 'info', 7000);
+}
+async function loadLayoutFile(file) {
+  try {
+    const j = JSON.parse(await file.text());
+    if (!j || !Array.isArray(j.widgets)) throw new Error('This file is not a dashboard layout.');
+    S.dash = normalize(j);
+    resetSelections(); S.maxId = null;
+    saveDash(); renderLayout(); await applyColors(); await refresh();
+    const miss = S.dash.widgets.filter(w => missingFields(w).length).length;
+    notify(miss ? `Layout loaded. ${miss} widget(s) use fields this layer does not have; open their settings to choose others.` : 'Layout loaded.', 'info', 6000);
+  } catch (e) { fail(e); }
+}
+async function resetLayout() {
+  try { localStorage.removeItem(S.sig); } catch (e) { /* ignore */ }
+  S.dash = normalize(autoDashboard(S.ds));
+  resetSelections(); S.maxId = null;
+  saveDash(); renderLayout(); await applyColors(); await refresh();
+}
+async function exportGeoJSON() {
+  if (!S.fc) return;
+  const w = buildWhere(S.filters, null, null);
+  let feats = S.fc.features;
+  if (w !== 'TRUE') { const t = await qTable(sqlIds(w)); feats = Array.from(t.getChildAt(0).toArray(), i => S.fc.features[i]); }
+  download('filtered.geojson', JSON.stringify({ type: 'FeatureCollection', features: feats }), 'application/geo+json');
+}
+
+/* CSV of the features matching `where`: the given columns, or every field plus area and length */
+async function exportCsv(where, cols, wg) {
+  if (!S.fc) return;
+  cols = cols || ['fid', ...S.ds.cols.map(c => c.name), ...S.ds.numFields.filter(n => DERIVED[n])];
+  const sql = n => kindOf(n) === 'date' ? `strftime(${qid(n)}, '%Y-%m-%d %H:%M:%S')` : qid(n);
+  const order = wg && wg.sortField && hasField(wg.sortField) ? `${sortSql(wg)} NULLS LAST, fid` : 'fid';
+  const t = await qTable(`SELECT ${cols.map((n, i) => `${sql(n)} AS c${i}`).join(', ')} FROM f WHERE ${where || 'TRUE'} ORDER BY ${order}`);
+  const V = cols.map((_, i) => t.getChildAt(i)), rows = new Array(t.numRows);
+  for (let r = 0; r < t.numRows; r++) rows[r] = V.map(v => { const x = v.get(r); return typeof x === 'bigint' ? Number(x) : x; });
+  const name = (S.dash.title || 'features').replace(/[\\/:*?"<>|]+/g, ' ').trim() || 'features';
+  await download(name + '.csv', toCsv(cols.map(n => (n === 'fid' ? 'Feature ID' : label(n))), rows), 'text/csv');
+}
+
+/* the map as it is drawn now: read the WebGL canvas right after a frame is rendered */
+function mapSnapshot() {
+  return new Promise(res => { S.map.once('render', () => res(S.map.getCanvas().toDataURL('image/png'))); S.map.triggerRepaint(); });
+}
+/* map image for reports: title, the map, its legend and the data credit */
+async function exportPng() {
+  if (!S.fc) return;
+  const url = await mapSnapshot(), img = new Image();
+  img.src = url; await img.decode();
+  // sizes in CSS pixels, drawn at the screen's pixel density so the map keeps its sharpness
+  const k = img.width / (S.map.getCanvas().clientWidth || img.width), pad = 24, head = 64, foot = 30, W = img.width / k, H = img.height / k;
+  const c = document.createElement('canvas'); c.width = Math.round((W + 2 * pad) * k); c.height = Math.round((H + head + foot) * k);
+  const g = c.getContext('2d'), ink = cssVar('--ink'), ink2 = cssVar('--ink2'), font = cssVar('--sans');
+  g.scale(k, k);
+  const cw = W + 2 * pad, ch = H + head + foot;
+  g.fillStyle = cssVar('--panel'); g.fillRect(0, 0, cw, ch);
+  g.fillStyle = ink; g.font = `600 22px ${font}`; g.fillText(S.dash.title, pad, 34);
+  g.fillStyle = ink2; g.font = `13px ${font}`; g.fillText($('srcName').textContent, pad, 54);
+  g.drawImage(img, pad, head, W, H);
+  g.strokeStyle = cssVar('--rule2'); g.strokeRect(pad + .5, head + .5, W - 1, H - 1);
+  const L = S.legend;
+  if (L && mapCfg().legend !== false) {           // legend in the lower left corner of the map
+    const rows = L.type === 'cat' ? [...L.items, ...(L.more ? [[ 'Other values', OTHER_COLOR ]] : [])] : [];
+    const lh = 18, bw = 210, bh = 30 + (L.type === 'cat' ? rows.length * lh : 34), x = pad + 12, y = head + H - bh - 12;
+    g.fillStyle = cssVar('--panel'); g.globalAlpha = .93; g.fillRect(x, y, bw, bh); g.globalAlpha = 1;
+    g.strokeStyle = cssVar('--rule2'); g.strokeRect(x + .5, y + .5, bw, bh);
+    g.fillStyle = ink; g.font = `600 12px ${font}`; g.fillText(label(L.field), x + 10, y + 19);
+    g.font = `12px ${font}`;
+    if (L.type === 'cat') rows.forEach(([k, col], i) => { g.fillStyle = col; g.fillRect(x + 10, y + 28 + i * lh, 14, 10); g.fillStyle = ink; g.fillText(String(k).slice(0, 28), x + 32, y + 37 + i * lh); });
+    else {
+      const gr = g.createLinearGradient(x + 10, 0, x + bw - 10, 0);
+      RAMP.forEach((col, i) => gr.addColorStop(i / (RAMP.length - 1), col));
+      g.fillStyle = gr; g.fillRect(x + 10, y + 28, bw - 20, 10);
+      g.fillStyle = ink2; g.fillText(fmt(L.lo), x + 10, y + 54); g.textAlign = 'right'; g.fillText(fmt(L.hi), x + bw - 10, y + 54); g.textAlign = 'left';
+    }
+  }
+  g.fillStyle = ink2; g.font = `11px ${font}`; g.textAlign = 'right';
+  g.fillText($('baseSel').value === 'none' ? '' : 'Basemap © OpenStreetMap contributors', cw - pad, ch - 10);
+  g.textAlign = 'left';
+  g.fillText(new Date().toLocaleString(), pad, ch - 10);
+  const blob = await new Promise(r => c.toBlob(r, 'image/png'));
+  await download('map.png', new Uint8Array(await blob.arrayBuffer()), 'image/png');
+}
+
+/* print (or "save as PDF" in the print dialog); WebGL canvases print blank, so the map is swapped for a picture of it */
+async function printDashboard() {
+  const img = el('img', 'printMap');
+  if (S.map) { img.src = await mapSnapshot(); await img.decode(); $('mapbox').append(img); }
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  window.print();
+  img.remove();
+}
+
+/* ---- search: text fields that contain the words typed, and feature numbers ---- */
+async function searchFeatures(text) {
+  const t = text.trim();
+  if (!t || !S.fc) return [];
+  const strCols = S.ds.cols.filter(c => c.kind === 'str').slice(0, 40).map(c => c.name);
+  const has = n => `contains(lower(${qid(n)}), ${qstr(t.toLowerCase())})`;
+  const conds = strCols.map(has);
+  if (/^\d+$/.test(t)) conds.push(`fid = ${nz(t)}`);
+  if (!conds.length) return [];
+  const tf = nameField();
+  const match = strCols.length ? `COALESCE(${strCols.map(n => `CASE WHEN ${has(n)} THEN ${qstr(label(n) + ': ')} || ${qid(n)} END`).join(', ')}, '')` : "''";
+  return q(`SELECT fid, ${tf ? `CAST(${qid(tf)} AS VARCHAR)` : 'NULL'} AS t, ${match} AS m FROM f WHERE ${conds.join(' OR ')} ORDER BY fid LIMIT 12`);
+}
+
+function wireSearch() {
+  const inp = $('searchIn'), box = $('results');
+  let hits = [], act = 0, seq = 0, timer;
+  const go = h => { box.hidden = true; inp.blur(); pick(h.fid, { fly: true }); };
+  const draw = () => {
+    box.replaceChildren();
+    if (!inp.value.trim()) { box.hidden = true; return; }
+    if (!hits.length) box.append(el('p', null, 'No features found.'));
+    hits.forEach((h, i) => {
+      const b = el('button', i === act ? 'act' : null); b.type = 'button';
+      b.append(el('b', null, h.t || `Feature ${h.fid}`), el('span', null, h.m || `Feature ${h.fid}`));
+      b.onmousedown = e => e.preventDefault();       // keep focus in the box until the click lands
+      b.onclick = () => go(h);
+      box.append(b);
+    });
+    box.hidden = false;
+  };
+  inp.addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const my = ++seq;
+      try { const r = await searchFeatures(inp.value); if (my !== seq) return; hits = r; act = 0; draw(); } catch (e) { fail(e); }
+    }, 180);
+  });
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); if (hits.length) { act = (act + (e.key === 'ArrowDown' ? 1 : hits.length - 1)) % hits.length; draw(); } }
+    else if (e.key === 'Enter') { e.preventDefault(); if (hits[act]) go(hits[act]); }
+    else if (e.key === 'Escape') { inp.value = ''; hits = []; box.hidden = true; inp.blur(); }
+  });
+  inp.addEventListener('blur', () => setTimeout(() => { box.hidden = true; }, 150));
+  inp.addEventListener('focus', () => { if (inp.value.trim()) draw(); });
+}
+
+/* ================================================================
+   13. WIRING
+   ================================================================ */
+const loadSample = () => { $('layerSel').hidden = true; ingest(sampleFeatures(), 'Sample parcels, Riyadh (synthetic)').catch(fail); };
+const openFiles = async () => {
+  if (!DESKTOP) return $('fileIn').click();
+  try { const picked = await window.desktop.openFiles(); if (picked.length) await handleFiles(asFiles(picked)); } catch (e) { fail(e); }
+};
+/* desktop only: a .gdb is a folder, so the app zips it and reads it like a dropped .gdb.zip */
+const openGdbFolder = async () => {
+  try { const z = await window.desktop.openFolder(); if (z) await handleFiles(asFiles([z])); } catch (e) { fail(e); }
+};
+
+function wireDesktop() {
+  const needData = fn => () => (S.fc ? fn() : notify('Open a layer first.'));
+  const actions = {
+    open: openFiles, openFolder: openGdbFolder, sample: loadSample,
+    exportGeoJSON: needData(() => exportGeoJSON().catch(fail)),
+    exportCSV: needData(() => exportCsv(buildWhere(S.filters, null, null)).catch(fail)),
+    exportPNG: needData(() => exportPng().catch(fail)),
+    print: () => printDashboard().catch(fail),
+    theme: () => setTheme(isDark() ? 'light' : 'dark'),
+    saveLayout: needData(() => saveLayoutFile().catch(fail)),
+    loadLayout: () => $('layoutIn').click(),
+    resetLayout: needData(() => resetLayout().catch(fail)),
+    edit: needData(() => setEditing(!S.editing)),
+    add: needData(() => { setEditing(true); openAdd(); }),
+    clearFilters: needData(clearAll),
+    zoomResults: needData(() => zoomToWhere(buildWhere(S.filters, 'map', null)).catch(fail))
+  };
+  window.desktop.onMenu(a => { const fn = actions[a]; if (fn) fn(); });
+  window.desktop.onOpenPaths(async paths => {
+    try { const files = await window.desktop.readPaths(paths); if (files.length) await handleFiles(asFiles(files)); } catch (e) { fail(e); }
+  });
+  const gdbBtn = el('button', 'btn'); gdbBtn.append(icon('folder'), 'Open .gdb folder');
+  gdbBtn.type = 'button'; gdbBtn.onclick = openGdbFolder;
+  $('openBtn2').after(gdbBtn);
+}
+
+function wireUi() {
+  $('openBtn').onclick = $('openBtn2').onclick = openFiles;
+  $('fileIn').onchange = e => { handleFiles(e.target.files); e.target.value = ''; };
+  $('sampleBtn').onclick = $('sampleBtn2').onclick = loadSample;
+  if (DESKTOP) wireDesktop();
+  $('layerSel').onchange = e => loadLayer(e.target.value).catch(fail);
+  $('editBtn').onclick = () => setEditing(!S.editing);
+  $('doneBtn').onclick = () => setEditing(false);
+  $('addBtn').onclick = openAdd;
+  const closeMenu = () => { $('layoutMenu').open = false; };
+  $('saveLayoutBtn').onclick = () => { closeMenu(); saveLayoutFile(); };
+  $('loadLayoutBtn').onclick = () => { closeMenu(); $('layoutIn').click(); };
+  $('layoutIn').onchange = e => { if (e.target.files[0]) loadLayoutFile(e.target.files[0]); e.target.value = ''; };
+  $('resetLayoutBtn').onclick = () => { closeMenu(); resetLayout().catch(fail); };
+  $('exportBtn').onclick = () => { closeMenu(); exportGeoJSON().catch(fail); };
+  $('csvBtn').onclick = () => { closeMenu(); exportCsv(buildWhere(S.filters, null, null)).catch(fail); };
+  $('pngBtn').onclick = () => { closeMenu(); exportPng().catch(fail); };
+  $('printBtn').onclick = () => { closeMenu(); printDashboard().catch(fail); };
+  $('themeBtn').onclick = () => setTheme(isDark() ? 'light' : 'dark');
+  document.addEventListener('click', e => { if (!e.target.closest('#layoutMenu')) closeMenu(); });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && S.maxId && !document.querySelector('dialog[open]') && e.target !== $('searchIn')) toggleMax(S.maxId);
+  });
+  $('dashTitle').addEventListener('input', () => { if (S.dash) { S.dash.title = $('dashTitle').textContent.trim() || 'Layer dashboard'; saveDash(); setWindowTitle(); } });
+  $('dashTitle').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); } });
+  $('baseSel').onchange = e => { if (S.mapReady) setBasemap(e.target.value); };
+  $('boxBtn').onclick = () => setBoxMode(!S.boxMode);
+  $('fitBtn').onclick = () => (S.fc ? zoomToWhere(buildWhere(S.filters, 'map', null)) : Promise.resolve()).catch(fail);
+  $('homeBtn').onclick = () => { if (S.ds) fitTo(S.ds.extent); };
+  $('mapMaxBtn').onclick = () => { if (S.fc) toggleMax('map'); };
+  $('msg').onclick = () => { $('msg').hidden = true; };
+  wireBoxSelect();
+  wireSearch();
+
+  let depth = 0;
+  addEventListener('dragenter', e => { if (S.dragId) return; e.preventDefault(); depth++; $('drop').hidden = false; });
+  addEventListener('dragleave', () => { if (S.dragId) return; depth = Math.max(0, depth - 1); if (!depth) $('drop').hidden = true; });
+  addEventListener('dragover', e => { if (!S.dragId) e.preventDefault(); });
+  addEventListener('drop', e => {
+    if (S.dragId) return;
+    e.preventDefault(); depth = 0; $('drop').hidden = true;
+    const folders = [];
+    for (const it of (e.dataTransfer.items || [])) { const en = it.webkitGetAsEntry && it.webkitGetAsEntry(); if (en && en.isDirectory) folders.push(en.name); }
+    handleFiles(e.dataTransfer.files, folders);
+  });
+}
+
+async function boot() {
+  renderLayout();
+  setTheme(isDark() ? 'dark' : 'light');
+  if (!window.maplibregl) { $('bootMsg').hidden = true; $('emptyMsg').textContent = 'lib/maplibre-gl.js is missing. Run "node get-libs.mjs" once (needs internet), then start the app again.'; return; }
+  // a shared layout next to the page (optional): the default for matching data
+  fetch('dashboard.json', { cache: 'no-store' }).then(r => (r.ok ? r.json() : null)).then(j => { S.shared = j && Array.isArray(j.widgets) ? j : null; }).catch(() => {});
+  initMap(await basemapStyle());
+  wireUi();
+  S.dbPromise = initDuckDB();
+  S.dbPromise.then(() => {
+    $('bootMsg').hidden = true;
+    for (const id of ['openBtn', 'openBtn2', 'sampleBtn', 'sampleBtn2']) $(id).disabled = false;
+  }).catch(e => {
+    console.error(e);
+    $('bootMsg').hidden = true;
+    $('emptyMsg').textContent = 'DuckDB did not start: ' + (e.message || e) + (location.protocol === 'file:' ? '' : ' Check that lib/duckdb/ holds the files copied by get-libs.mjs.');
+  });
+  S.dbPromise.catch(() => {});
+}
+boot();
+</script>
+</body>
+</html>

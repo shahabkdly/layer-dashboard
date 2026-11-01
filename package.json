@@ -1,0 +1,53 @@
+{
+  "name": "layer-dashboard",
+  "productName": "Layer dashboard",
+  "version": "1.1.0",
+  "description": "Offline GIS analytics dashboard: MapLibre GL JS, DuckDB-WASM and GDAL-WASM, with no server and no internet",
+  "main": "electron/main.js",
+  "private": true,
+  "scripts": {
+    "libs": "node get-libs.mjs",
+    "start": "node electron/start.js",
+    "dist": "electron-builder --win nsis zip portable",
+    "dist:portable": "electron-builder --win zip portable",
+    "dist:dir": "electron-builder --win --dir"
+  },
+  "devDependencies": {
+    "electron": "44.4.3",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "local.layer.dashboard",
+    "productName": "Layer dashboard",
+    "asar": false,
+    "files": [
+      "index.html",
+      "dashboard.json",
+      "electron/**",
+      "lib/**"
+    ],
+    "extraMetadata": { "main": "electron/main.js" },
+    "electronFuses": { "runAsNode": false },
+    "directories": { "output": "dist" },
+    "win": {
+      "icon": "electron/icon.png",
+      "target": [{ "target": "nsis", "arch": ["x64"] }, { "target": "zip", "arch": ["x64"] }, { "target": "portable", "arch": ["x64"] }],
+      "fileAssociations": [
+        { "ext": "gpkg", "name": "GeoPackage", "role": "Viewer" },
+        { "ext": "geojson", "name": "GeoJSON", "role": "Viewer" }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "Layer dashboard"
+    },
+    "portable": {
+      "artifactName": "${productName} ${version} portable.${ext}",
+      "unpackDirName": "LayerDashboard"
+    },
+    "mac": { "target": ["dmg"], "category": "public.app-category.productivity" },
+    "linux": { "target": ["AppImage"], "category": "Science" }
+  }
+}
